@@ -352,22 +352,21 @@ CMD ["node", "dist/api/index.js"]
 
 ```bash
 # Instalar dependencias
-npm install
+bun install
 
-# Crear .env
-cp .env.example .env
+# Crear .env (opcional; bun carga .env/.env.local)
+cp .env.example .env.local
 
-# Inicializar base de datos
-npm run db:init
+# La base de datos SQLite se inicializa automáticamente al arrancar el backend.
 
 # Desarrollo (API + Web en paralelo)
-npm run dev
+bun run dev
 
 # Solo API
-npm run dev:api
+bun run --cwd packages/api dev
 
 # Solo Web
-npm run dev:web
+bun run --cwd packages/web dev
 ```
 
 ### Scripts de `package.json`
@@ -375,17 +374,9 @@ npm run dev:web
 ```json
 {
   "scripts": {
-    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
-    "dev:api": "cd packages/api && npm run dev",
-    "dev:web": "cd packages/web && npm run dev",
-    "build": "npm run build:api && npm run build:web",
-    "build:api": "cd packages/api && npm run build",
-    "build:web": "cd packages/web && npm run build",
-    "db:init": "cd packages/api && npm run db:init",
-    "db:migrate": "cd packages/api && npm run db:migrate",
-    "test": "vitest",
-    "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "dev": "bunx concurrently \"bun run --cwd packages/api dev\" \"bun run --cwd packages/web dev\"",
+    "build": "bun run --cwd packages/api build && bun run --cwd packages/web build",
+    "test": "bun run --cwd packages/api test"
   }
 }
 ```

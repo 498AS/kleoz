@@ -9,10 +9,11 @@ Implementación funcional inicial de **kleoz** con foco en:
 
 ## Stack implementado
 
-- **Backend**: Hono + WebSocket + TypeScript.
+- **Backend**: Hono + Bun WebSocket + TypeScript.
 - **Frontend**: React + Vite + TypeScript.
 - **Auth**: JWT con usuario admin por defecto (`admin` / `admin1234`).
-- **Persistencia**: In-memory (base lista para evolucionar a SQLite).
+- **Persistencia**: SQLite (usuarios, uploads, mensajes locales).
+- **Agentes**: OpenClaw Gateway (requerido; el backend no arranca si no conecta).
 
 ## Estructura
 
@@ -22,8 +23,8 @@ Implementación funcional inicial de **kleoz** con foco en:
 ## Desarrollo
 
 ```bash
-npm install
-npm run dev
+bun install
+bun run dev
 ```
 
 - API: `http://localhost:3000`
@@ -32,7 +33,7 @@ npm run dev
 ## Tests
 
 ```bash
-npm test
+bun test
 ```
 
 ## Estado del proyecto

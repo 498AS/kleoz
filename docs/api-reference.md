@@ -325,7 +325,7 @@ ws://localhost:3000/api/ws
 ```json
 {
   "type": "connected",
-  "sessionId": "ws_session_uuid"
+  "wsSessionId": "ws_session_uuid"
 }
 ```
 
