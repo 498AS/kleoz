@@ -32,4 +32,10 @@ export interface JwtClaims {
   username: string;
   role: Role;
   agentId: string;
+  [key: string]: unknown;
 }
+
+// Hono context variables
+export type Variables = {
+  user: JwtClaims;
+};

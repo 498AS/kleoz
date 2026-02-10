@@ -28,7 +28,8 @@ function App() {
 
   useEffect(() => {
     if (!token) return;
-    const ws = new WebSocket(`ws://localhost:3000/api/ws?token=${encodeURIComponent(token)}`);
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${wsProtocol}//${window.location.host}/api/ws?token=${encodeURIComponent(token)}`);
     wsRef.current = ws;
     ws.onmessage = (event) => {
       const payload = JSON.parse(event.data);

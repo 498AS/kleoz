@@ -6,7 +6,9 @@
     "strict": true,
     "outDir": "dist",
     "rootDir": "src",
-    "types": ["node"]
+    "types": ["node"],
+    "skipLibCheck": true
   },
-  "include": ["src", "test"]
+  "include": ["src"],
+  "exclude": ["test", "node_modules", "dist"]
 }

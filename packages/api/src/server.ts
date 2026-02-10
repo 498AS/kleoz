@@ -5,11 +5,11 @@ import type { Context, Next } from 'hono';
 import type { WebSocketServer } from 'ws';
 import { InMemoryStore } from './store.js';
 import { signToken, verifyToken } from './auth.js';
-import type { JwtClaims } from './types.js';
+import type { JwtClaims, Variables } from './types.js';
 import { RealtimeHub } from './realtime.js';
 
 export function buildApp(store = new InMemoryStore(), hub = new RealtimeHub()) {
-  const app = new Hono();
+  const app = new Hono<{ Variables: Variables }>();
 
   const loginSchema = z.object({ username: z.string(), password: z.string() });
   const userSchema = z.object({ username: z.string(), password: z.string().min(8), role: z.enum(['admin', 'user']), agentId: z.string() });
