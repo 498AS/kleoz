@@ -4,10 +4,12 @@ import type {
   AuthLoginRequest,
   AuthLoginResponse,
   AuthLogoutResponse,
+  SessionDetail,
   MessagesSendRequest,
   MessagesSendResponse,
   MessagesUploadResponse,
   PresenceEntry,
+  SessionsDeleteResponse,
   SessionsHistoryResponse,
   SessionsListResponse,
   UserMe,
@@ -94,6 +96,11 @@ export async function listSessions(token: string, limit = 50): Promise<SessionsL
   return apiFetchJson<SessionsListResponse>(url.pathname + url.search, { token });
 }
 
+export async function getSession(token: string, sessionKey: string): Promise<SessionDetail> {
+  const url = `/api/sessions/${encodeSessionKey(sessionKey)}`;
+  return apiFetchJson<SessionDetail>(url, { token });
+}
+
 export async function getHistory(
   token: string,
   sessionKey: string,
@@ -125,6 +132,11 @@ export async function uploadMessageFile(token: string, file: File): Promise<Mess
   });
 }
 
+export async function deleteSession(token: string, sessionKey: string): Promise<SessionsDeleteResponse> {
+  const url = `/api/sessions/${encodeSessionKey(sessionKey)}`;
+  return apiFetchJson<SessionsDeleteResponse>(url, { method: 'DELETE', token });
+}
+
 export type PresenceGetResponse = {
   entries: PresenceEntry[];
   gatewayUptime: number;
@@ -134,4 +146,3 @@ export type PresenceGetResponse = {
 export async function getPresence(token: string): Promise<PresenceGetResponse> {
   return apiFetchJson<PresenceGetResponse>('/api/presence', { token });
 }
-

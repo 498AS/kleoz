@@ -3,14 +3,78 @@ import type {
   ChatMessage,
   MessageAttachment,
   PresenceEntry,
+  SessionDetail,
   SessionSummary,
   UserMe,
   WsServerEvent,
 } from '@kleoz/contracts';
 
-import { ApiRequestError, getHistory, getMe, getPresence, listSessions, login, logout, sendMessage, uploadMessageFile } from './lib/api';
-import { clearAuth, getOrCreateInstanceId, loadAuth, saveAuth } from './lib/storage';
-import { WsClient, type WsClientState } from './lib/wsClient';
+import {
+  ApiRequestError,
+  deleteSession,
+  getHistory,
+  getMe,
+  getPresence,
+  getSession,
+  listSessions,
+  login,
+  logout,
+  sendMessage,
+  uploadMessageFile,
+} from '@/lib/api';
+import { clearAuth, getOrCreateInstanceId, loadAuth, saveAuth } from '@/lib/storage';
+import { WsClient, type WsClientState } from '@/lib/wsClient';
+import { cn } from '@/lib/utils';
+
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Separator } from '@/components/ui/separator';
+import { Switch } from '@/components/ui/switch';
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuAction,
+  SidebarMenuBadge,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarSeparator,
+  SidebarTrigger,
+} from '@/components/ui/sidebar';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+
+import { CheckCircle2, Loader2, LogOut, Paperclip, Send, Trash2, Wifi, WifiOff } from 'lucide-react';
 
 type ComposerAttachment = {
   id: string;
@@ -83,11 +147,18 @@ export function App() {
   const [bootError, setBootError] = useState<string>('');
   const [token, setToken] = useState<string>('');
   const [expiresAt, setExpiresAt] = useState<string>('');
-  const [user, setUser] = useState<{ id: string; username: string; agentId: string; role: 'admin' | 'user'; createdAt: string } | null>(null);
+  const [user, setUser] = useState<{
+    id: string;
+    username: string;
+    agentId: string;
+    role: 'admin' | 'user';
+    createdAt: string;
+  } | null>(null);
   const [me, setMe] = useState<UserMe | null>(null);
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSessionKey, setActiveSessionKey] = useState<string>('');
+  const [activeSessionDetail, setActiveSessionDetail] = useState<SessionDetail | null>(null);
   const [sessionsState, setSessionsState] = useState<Record<string, SessionState>>({});
   const [includeTools, setIncludeTools] = useState<boolean>(false);
 
@@ -102,6 +173,9 @@ export function App() {
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [sending, setSending] = useState<boolean>(false);
 
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState<boolean>(false);
+  const [deleteTargetKey, setDeleteTargetKey] = useState<string>('');
+
   const activeSession = useMemo(
     () => sessions.find((s) => s.key === activeSessionKey) ?? null,
     [sessions, activeSessionKey],
@@ -114,7 +188,18 @@ export function App() {
     [composerAttachments],
   );
 
-  // Boot from localStorage.
+  const wsBadge = useMemo(() => {
+    if (wsState.status === 'open') return { variant: 'secondary' as const, icon: Wifi, text: 'WS conectado' };
+    if (wsState.status === 'connecting') return { variant: 'outline' as const, icon: Loader2, text: 'WS conectando' };
+    if (wsState.status === 'error') return { variant: 'destructive' as const, icon: WifiOff, text: 'WS error' };
+    return { variant: 'outline' as const, icon: WifiOff, text: 'WS offline' };
+  }, [wsState.status]);
+
+  const presenceList = useMemo(
+    () => Object.values(presence).sort((a, b) => (a.host || '').localeCompare(b.host || '')),
+    [presence],
+  );
+
   useEffect(() => {
     const stored = loadAuth();
     if (!stored) return;
@@ -123,13 +208,13 @@ export function App() {
     setUser(stored.user);
   }, []);
 
-  // When token changes, load /me and sessions, connect WS, fetch presence.
   useEffect(() => {
     let cancelled = false;
     async function run() {
       setBootError('');
       setGlobalNotice('');
       if (!token) return;
+
       try {
         const meOut = await getMe(token);
         if (cancelled) return;
@@ -159,12 +244,10 @@ export function App() {
         for (const entry of p.entries ?? []) map[entry.instanceId] = entry;
         setPresence(map);
         setPresenceMeta({ gatewayUptime: p.gatewayUptime, timestamp: p.timestamp });
-      } catch (e) {
-        if (cancelled) return;
+      } catch {
         // Presence is best-effort.
       }
 
-      // WS connect after we have a token.
       const instanceId = getOrCreateInstanceId();
       const client = new WsClient({
         token,
@@ -190,6 +273,7 @@ export function App() {
         client.close();
       };
     }
+
     void run();
     return () => {
       cancelled = true;
@@ -197,14 +281,33 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
-  // Keep WS subscriptions aligned with "visible" sessions + active session.
   useEffect(() => {
     const keys = new Set<string>(sessions.map((s) => s.key));
     if (activeSessionKey) keys.add(activeSessionKey);
     wsRef.current?.setDesiredSubscriptions(Array.from(keys));
   }, [sessions, activeSessionKey]);
 
-  // Load history when changing sessions.
+  useEffect(() => {
+    if (!token || !activeSessionKey) {
+      setActiveSessionDetail(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const d = await getSession(token, activeSessionKey);
+        if (cancelled) return;
+        setActiveSessionDetail(d);
+      } catch {
+        if (cancelled) return;
+        setActiveSessionDetail(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token, activeSessionKey]);
+
   useEffect(() => {
     if (!token || !activeSessionKey) return;
     const st = sessionsState[activeSessionKey];
@@ -237,6 +340,7 @@ export function App() {
       ...prev,
       [sessionKey]: { ...(prev[sessionKey] ?? current), loading: true },
     }));
+
     try {
       const before = args.reset ? undefined : current.nextCursor;
       const out = await getHistory(token, sessionKey, { limit: 100, includeTools, before });
@@ -245,7 +349,6 @@ export function App() {
       setSessionsState((prev) => {
         const prevSt = prev[sessionKey] ?? current;
         const merged = args.reset ? nextMessages : [...nextMessages, ...prevSt.messages];
-        // De-dupe by id while preserving order.
         const seen = new Set<string>();
         const deduped: ChatMessage[] = [];
         for (const m of merged) {
@@ -355,7 +458,6 @@ export function App() {
           [sessionKey]: { ...st, messages: nextMessages, streamingByRunId: streaming },
         };
       });
-      // Touch updatedAt for ordering.
       setSessions((prev) => {
         const idx = prev.findIndex((s) => s.key === sessionKey);
         if (idx === -1) return prev;
@@ -367,7 +469,6 @@ export function App() {
     }
 
     if (event.type === 'tool.call' || event.type === 'tool.result') {
-      // Minimal handling: surface in notice area for now (keeps protocol covered).
       const name = event.tool?.name ?? 'tool';
       setGlobalNotice(`[${event.type}] ${name} (${event.tool?.status ?? 'unknown'})`);
       return;
@@ -431,6 +532,7 @@ export function App() {
     setMe(null);
     setSessions([]);
     setActiveSessionKey('');
+    setActiveSessionDetail(null);
     setSessionsState({});
     setPresence({});
     clearAuth();
@@ -446,6 +548,7 @@ export function App() {
   async function handlePickFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
     const list = Array.from(files);
+
     for (const file of list) {
       const id = crypto.randomUUID();
       const kind = attachmentTypeFromMime(file.type || 'application/octet-stream');
@@ -458,21 +561,21 @@ export function App() {
       };
       setComposerAttachments((prev) => [...prev, att]);
 
-      // Upload (contract: /api/messages/upload).
       void (async () => {
         try {
           const out = await uploadMessageFile(token, file);
           setComposerAttachments((prev) =>
-            prev.map((a) => (a.id === id ? { ...a, upload: { id: out.id, url: out.url, expiresAt: out.expiresAt, size: out.size } } : a)),
+            prev.map((a) =>
+              a.id === id
+                ? { ...a, upload: { id: out.id, url: out.url, expiresAt: out.expiresAt, size: out.size } }
+                : a,
+            ),
           );
         } catch (e) {
-          setComposerAttachments((prev) =>
-            prev.map((a) => (a.id === id ? { ...a, error: humanizeError(e) } : a)),
-          );
+          setComposerAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, error: humanizeError(e) } : a)));
         }
       })();
 
-      // Base64 (for send attachments per contract).
       void (async () => {
         try {
           const dataUrl = await readFileAsDataUrl(file);
@@ -492,8 +595,10 @@ export function App() {
       setGlobalNotice('No tienes permisos para enviar mensajes.');
       return;
     }
+
     const text = composerText.trim();
     if (!text && composerAttachments.length === 0) return;
+
     if (attachmentsPending) {
       setGlobalNotice('Esperando a procesar attachments (base64).');
       return;
@@ -527,243 +632,479 @@ export function App() {
     }
   }
 
+  async function handleConfirmDeleteSession() {
+    const key = deleteTargetKey;
+    if (!token || !key) return;
+    setDeleteDialogOpen(false);
+    setDeleteTargetKey('');
+    setGlobalNotice('');
+
+    try {
+      await deleteSession(token, key);
+      setSessions((prev) => removeSession(prev, key));
+      setSessionsState((prev) => {
+        const copy = { ...prev };
+        delete copy[key];
+        return copy;
+      });
+      if (activeSessionKey === key) setActiveSessionKey('');
+    } catch (e) {
+      setGlobalNotice(humanizeError(e));
+    }
+  }
+
   if (!token || !user) {
     return (
-      <main className="app-shell">
-        <div className="login-card">
-          <div className="brand">
-            <div className="brand-title">kleoz</div>
-            <div className="brand-subtitle">Web chat</div>
-          </div>
-          <LoginForm onLogin={doLogin} error={bootError} />
-          <div className="muted small">
-            Consejo: el backend define usuarios. Si falla, revisa el error exacto arriba.
-          </div>
+      <div className="min-h-svh p-6 md:p-10">
+        <div className="mx-auto flex w-full max-w-sm flex-col justify-center gap-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>kleoz</CardTitle>
+              <CardDescription>Login para acceder al chat</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <LoginForm onLogin={doLogin} error={bootError} />
+            </CardContent>
+          </Card>
         </div>
-      </main>
+      </div>
     );
   }
 
-  const wsBadge =
-    wsState.status === 'open'
-      ? { cls: 'ok', text: `WS: conectado${wsState.wsSessionId ? ` (${wsState.wsSessionId})` : ''}` }
-      : wsState.status === 'connecting'
-        ? { cls: 'warn', text: 'WS: conectando...' }
-        : wsState.status === 'error'
-          ? { cls: 'bad', text: `WS: error${wsState.lastError ? ` (${wsState.lastError.code})` : ''}` }
-          : { cls: 'muted', text: 'WS: desconectado' };
-
-  const presenceList = Object.values(presence).sort((a, b) => (a.host || '').localeCompare(b.host || ''));
+  const sessionTitle = activeSession?.displayName || activeSession?.channel || activeSession?.key || 'Selecciona una sesion';
 
   return (
-    <main className="layout">
-      <aside className="sidebar">
-        <div className="sidebar-top">
-          <div className="user-row">
-            <div className="user-meta">
-              <div className="user-name">{user.username}</div>
-              <div className="muted small">
-                {user.role} · exp {new Date(expiresAt).toLocaleString()}
+    <SidebarProvider defaultOpen>
+      <AppSidebar
+        user={user}
+        sessions={sessions}
+        activeSessionKey={activeSessionKey}
+        onSelectSession={(k) => setActiveSessionKey(k)}
+        wsState={wsState}
+        presenceList={presenceList}
+        presenceMeta={presenceMeta}
+        onRequestDelete={(k) => {
+          setDeleteTargetKey(k);
+          setDeleteDialogOpen(true);
+        }}
+      />
+
+      <SidebarInset className="min-h-svh">
+        <div className="flex h-svh flex-col">
+          <header className="flex items-center gap-2 border-b px-3 py-2">
+            <SidebarTrigger />
+            <Separator orientation="vertical" className="h-5" />
+
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-medium">{sessionTitle}</div>
+              {activeSessionKey ? (
+                <div className="truncate text-xs text-muted-foreground">{activeSessionKey}</div>
+              ) : null}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Badge variant={wsBadge.variant} className="hidden md:inline-flex">
+                <wsBadge.icon className={cn('mr-1 h-3.5 w-3.5', wsState.status === 'connecting' ? 'animate-spin' : '')} />
+                {wsBadge.text}
+              </Badge>
+
+              {activeSession?.status ? (
+                <Badge
+                  variant={activeSession.status === 'idle' ? 'secondary' : activeSession.status === 'thinking' ? 'outline' : 'default'}
+                >
+                  {activeSession.status}
+                </Badge>
+              ) : null}
+
+              <div className="hidden items-center gap-2 md:flex">
+                <Switch
+                  id="include-tools"
+                  checked={includeTools}
+                  onCheckedChange={(v) => {
+                    setIncludeTools(Boolean(v));
+                    if (activeSessionKey) void loadHistory({ sessionKey: activeSessionKey, reset: true });
+                  }}
+                />
+                <Label htmlFor="include-tools" className="text-xs text-muted-foreground">
+                  tools
+                </Label>
+              </div>
+
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="sm" className="gap-2">
+                    <Avatar className="h-6 w-6">
+                      <AvatarFallback className="text-[10px]">{initials(user.username)}</AvatarFallback>
+                    </Avatar>
+                    <span className="hidden sm:inline">{user.username}</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuLabel>Cuenta</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem disabled>
+                    <span className="text-xs text-muted-foreground">{user.role} · exp {new Date(expiresAt).toLocaleString()}</span>
+                  </DropdownMenuItem>
+                  {activeSessionDetail?.transcriptPath ? (
+                    <DropdownMenuItem disabled>
+                      <span className="text-xs text-muted-foreground">transcript: {activeSessionDetail.transcriptPath}</span>
+                    </DropdownMenuItem>
+                  ) : null}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => void doLocalLogout(true)} className="gap-2">
+                    <LogOut className="h-4 w-4" />
+                    Logout
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </header>
+
+          {globalNotice ? (
+            <div className="p-3">
+              <Alert>
+                <AlertTitle>Info</AlertTitle>
+                <AlertDescription>{globalNotice}</AlertDescription>
+              </Alert>
+            </div>
+          ) : null}
+
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex items-center gap-2 border-b px-3 py-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!activeState?.hasMore || activeState?.loading || !activeSessionKey}
+                onClick={() => activeSessionKey && void loadHistory({ sessionKey: activeSessionKey, reset: false })}
+              >
+                {activeState?.loading ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Cargando...
+                  </>
+                ) : activeState?.hasMore ? (
+                  'Cargar mas (older)'
+                ) : (
+                  'Sin mas'
+                )}
+              </Button>
+
+              <div className="ml-auto flex items-center gap-2 md:hidden">
+                <Switch
+                  id="include-tools-mobile"
+                  checked={includeTools}
+                  onCheckedChange={(v) => {
+                    setIncludeTools(Boolean(v));
+                    if (activeSessionKey) void loadHistory({ sessionKey: activeSessionKey, reset: true });
+                  }}
+                />
+                <Label htmlFor="include-tools-mobile" className="text-xs text-muted-foreground">
+                  tools
+                </Label>
               </div>
             </div>
-            <button className="btn" onClick={() => void doLocalLogout(true)}>
-              Logout
-            </button>
-          </div>
 
-          <div className={`badge ${wsBadge.cls}`}>{wsBadge.text}</div>
-          {globalNotice ? <div className="notice">{globalNotice}</div> : null}
-        </div>
+            <ScrollArea className="min-h-0 flex-1">
+              <div className="mx-auto w-full max-w-4xl space-y-3 p-4">
+                {!activeSessionKey ? (
+                  <div className="text-sm text-muted-foreground">Selecciona una sesion en el sidebar.</div>
+                ) : null}
 
-        <div className="sidebar-section">
-          <div className="section-title">Sesiones</div>
-          <div className="sessions">
-            {sessions.length === 0 ? <div className="muted small">Sin sesiones.</div> : null}
-            {sessions.map((s) => (
-              <button
-                key={s.key}
-                className={`session-item ${s.key === activeSessionKey ? 'active' : ''}`}
-                onClick={() => setActiveSessionKey(s.key)}
-                title={s.key}
-              >
-                <div className="session-main">
-                  <div className="session-title">{s.displayName || s.channel || s.key}</div>
-                  <div className="muted small">
-                    {s.kind} · {new Date(s.updatedAt).toLocaleString()}
-                  </div>
-                </div>
-                <div className={`status-pill ${s.status ?? 'idle'}`}>{s.status ?? 'idle'}</div>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="sidebar-section">
-          <div className="section-title">
-            Presence <span className="muted small">({presenceList.length})</span>
-          </div>
-          {presenceMeta.timestamp ? (
-            <div className="muted small">ts: {new Date(presenceMeta.timestamp).toLocaleString()}</div>
-          ) : null}
-          <div className="presence">
-            {presenceList.length === 0 ? <div className="muted small">Sin presencia.</div> : null}
-            {presenceList.slice(0, 20).map((p) => (
-              <div key={p.instanceId} className="presence-row" title={p.instanceId}>
-                <div className="presence-host">{p.host}</div>
-                <div className="muted small">
-                  {p.mode}
-                  {typeof p.lastInputSeconds === 'number' ? ` · ${p.lastInputSeconds}s` : ''}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </aside>
-
-      <section className="chat">
-        <header className="chat-header">
-          <div className="chat-title">{activeSession ? activeSession.displayName || activeSession.channel || activeSession.key : 'Selecciona una sesion'}</div>
-          <div className="chat-actions">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={includeTools}
-                onChange={(e) => {
-                  setIncludeTools(e.target.checked);
-                  if (activeSessionKey) void loadHistory({ sessionKey: activeSessionKey, reset: true });
-                }}
-              />
-              <span>incluir tools</span>
-            </label>
-            {activeSession?.status ? <div className={`status-pill ${activeSession.status}`}>{activeSession.status}</div> : null}
-          </div>
-        </header>
-
-        <div className="chat-body">
-          {!activeSessionKey ? <div className="muted">Selecciona una sesion en la barra lateral.</div> : null}
-          {activeSessionKey ? (
-            <>
-              <div className="chat-toolbar">
-                <button
-                  className="btn"
-                  disabled={!activeState?.hasMore || activeState?.loading}
-                  onClick={() => void loadHistory({ sessionKey: activeSessionKey, reset: false })}
-                >
-                  {activeState?.loading ? 'Cargando...' : activeState?.hasMore ? 'Cargar mas (older)' : 'Sin mas'}
-                </button>
-              </div>
-
-              <div className="messages">
                 {activeMessages.map((m) => (
                   <MessageBubble key={m.id} msg={m} />
                 ))}
+
                 {Object.entries(activeStreaming).map(([runId, text]) => (
-                  <div key={runId} className="bubble assistant streaming">
-                    <div className="bubble-meta">assistant · streaming</div>
-                    <div className="bubble-content">{text}</div>
+                  <div key={runId} className="rounded-lg border bg-muted/30 p-3">
+                    <div className="mb-2 text-xs text-muted-foreground">assistant · streaming</div>
+                    <div className="whitespace-pre-wrap text-sm leading-relaxed">{text}</div>
                   </div>
                 ))}
               </div>
-            </>
-          ) : null}
-        </div>
+            </ScrollArea>
 
-        <footer className="composer">
-          <div className="composer-row">
-            <textarea
-              className="composer-input"
-              placeholder={me?.permissions?.canSendMessages ? 'Escribe un mensaje...' : 'No tienes permisos para enviar mensajes.'}
-              value={composerText}
-              disabled={!me?.permissions?.canSendMessages || sending || !activeSessionKey}
-              onChange={(e) => setComposerText(e.target.value)}
-            />
-          </div>
-
-          <div className="composer-row">
-            <input
-              className="file-input"
-              type="file"
-              multiple
-              disabled={sending || !activeSessionKey}
-              onChange={(e) => void handlePickFiles(e.target.files)}
-            />
-            <button
-              className="btn primary"
-              disabled={sending || attachmentsPending || (!composerText.trim() && composerAttachments.length === 0) || !activeSessionKey}
-              onClick={() => void handleSend()}
-            >
-              {sending ? 'Enviando...' : 'Enviar'}
-            </button>
-          </div>
-
-          {composerAttachments.length ? (
-            <div className="attachments">
-              {composerAttachments.map((a) => (
-                <div key={a.id} className="attachment">
-                  <div className="attachment-main">
-                    <div className="attachment-name">{a.filename}</div>
-                    <div className="muted small">
-                      {a.mimeType}
-                      {!a.dataBase64 && !a.error ? ' · procesando...' : ''}
-                      {a.upload?.url ? (
-                        <>
-                          {' '}
-                          · <a href={a.upload.url} target="_blank" rel="noreferrer">descargar</a>
-                        </>
-                      ) : null}
-                    </div>
-                    {a.error ? <div className="error small">{a.error}</div> : null}
+            <div className="border-t p-3">
+              <div className="mx-auto w-full max-w-4xl space-y-3">
+                {composerAttachments.length ? (
+                  <div className="space-y-2">
+                    {composerAttachments.map((a) => (
+                      <div key={a.id} className="flex items-center justify-between gap-3 rounded-lg border bg-card/30 p-2">
+                        <div className="min-w-0">
+                          <div className="truncate text-sm">{a.filename}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {a.mimeType}
+                            {!a.dataBase64 && !a.error ? ' · procesando...' : ''}
+                            {a.upload?.url ? (
+                              <>
+                                {' '}
+                                ·{' '}
+                                <a className="underline" href={a.upload.url} target="_blank" rel="noreferrer">
+                                  descargar
+                                </a>
+                              </>
+                            ) : null}
+                          </div>
+                          {a.error ? <div className="text-xs text-destructive">{a.error}</div> : null}
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => setComposerAttachments((prev) => prev.filter((x) => x.id !== a.id))}>
+                          Quitar
+                        </Button>
+                      </div>
+                    ))}
                   </div>
-                  <button className="btn" onClick={() => setComposerAttachments((prev) => prev.filter((x) => x.id !== a.id))}>
-                    Quitar
-                  </button>
+                ) : null}
+
+                <Textarea
+                  placeholder={me?.permissions?.canSendMessages ? 'Escribe un mensaje...' : 'No tienes permisos para enviar mensajes.'}
+                  value={composerText}
+                  disabled={!me?.permissions?.canSendMessages || sending || !activeSessionKey}
+                  onChange={(e) => setComposerText(e.target.value)}
+                />
+
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <div className="flex items-center gap-2">
+                    <Label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                      <Paperclip className="h-4 w-4" />
+                      Adjuntos
+                    </Label>
+                    <Input
+                      type="file"
+                      multiple
+                      className="w-full sm:w-[260px]"
+                      disabled={sending || !activeSessionKey}
+                      onChange={(e) => void handlePickFiles(e.target.files)}
+                    />
+                  </div>
+
+                  <div className="sm:ml-auto">
+                    <Button
+                      className="w-full sm:w-auto"
+                      disabled={sending || attachmentsPending || (!composerText.trim() && composerAttachments.length === 0) || !activeSessionKey}
+                      onClick={() => void handleSend()}
+                    >
+                      {sending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Send className="mr-2 h-4 w-4" />}
+                      Enviar
+                    </Button>
+                  </div>
                 </div>
-              ))}
+
+                <div className="text-xs text-muted-foreground">
+                  Fuente de verdad: WS `message.complete`. Uploads solo dan `url` para preview/descarga.
+                </div>
+              </div>
             </div>
-          ) : null}
-        </footer>
-      </section>
-    </main>
+          </div>
+        </div>
+      </SidebarInset>
+
+      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Eliminar sesion</AlertDialogTitle>
+            <AlertDialogDescription>
+              Esto borrara la sesion y su historial. sessionKey: <span className="font-mono">{deleteTargetKey}</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void handleConfirmDeleteSession()} className="gap-2">
+              <Trash2 className="h-4 w-4" />
+              Eliminar
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </SidebarProvider>
   );
 }
 
 function LoginForm(props: { onLogin: (u: string, p: string) => void; error?: string }) {
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
+
   return (
     <form
-      className="login-form"
+      className="space-y-4"
       onSubmit={(e) => {
         e.preventDefault();
         props.onLogin(username.trim(), password);
       }}
     >
-      <label className="field">
-        <div className="field-label">Username</div>
-        <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="username" autoComplete="username" />
-      </label>
-      <label className="field">
-        <div className="field-label">Password</div>
-        <input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="password" type="password" autoComplete="current-password" />
-      </label>
-      {props.error ? <div className="error">{props.error}</div> : null}
-      <button className="btn primary" type="submit">
+      <div className="space-y-2">
+        <Label htmlFor="username">Username</Label>
+        <Input id="username" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="password">Password</Label>
+        <Input
+          id="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          type="password"
+          autoComplete="current-password"
+        />
+      </div>
+
+      {props.error ? (
+        <Alert variant="destructive">
+          <AlertTitle>Error</AlertTitle>
+          <AlertDescription>{props.error}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <Button type="submit" className="w-full">
         Entrar
-      </button>
+      </Button>
     </form>
+  );
+}
+
+function AppSidebar(props: {
+  user: { id: string; username: string; agentId: string; role: 'admin' | 'user'; createdAt: string };
+  sessions: SessionSummary[];
+  activeSessionKey: string;
+  onSelectSession: (k: string) => void;
+  onRequestDelete: (k: string) => void;
+  wsState: WsClientState;
+  presenceList: PresenceEntry[];
+  presenceMeta: { gatewayUptime?: number; timestamp?: number };
+}) {
+  const ws = props.wsState;
+  const wsText = ws.status === 'open' ? 'conectado' : ws.status === 'connecting' ? 'conectando' : ws.status;
+
+  return (
+    <Sidebar collapsible="icon" variant="sidebar">
+      <SidebarHeader className="gap-2">
+        <div className="flex items-center gap-2 px-1">
+          <Avatar className="h-8 w-8">
+            <AvatarFallback className="text-xs">{initials(props.user.username)}</AvatarFallback>
+          </Avatar>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-medium">{props.user.username}</div>
+            <div className="truncate text-xs text-muted-foreground">{props.user.role}</div>
+          </div>
+          <Badge variant={ws.status === 'open' ? 'secondary' : ws.status === 'error' ? 'destructive' : 'outline'} className="gap-1">
+            {ws.status === 'open' ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
+            <span className="hidden xl:inline">WS</span>
+          </Badge>
+        </div>
+
+        <SidebarSeparator />
+      </SidebarHeader>
+
+      <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupLabel>Sesiones</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {props.sessions.map((s) => {
+                const title = s.displayName || s.channel || s.key;
+                const isActive = s.key === props.activeSessionKey;
+                const status = s.status ?? 'idle';
+                return (
+                  <SidebarMenuItem key={s.key}>
+                    <SidebarMenuButton asChild isActive={isActive} tooltip={title}>
+                      <button onClick={() => props.onSelectSession(s.key)}>
+                        <span className="truncate">{title}</span>
+                      </button>
+                    </SidebarMenuButton>
+                    <SidebarMenuBadge className={cn(status === 'idle' ? 'text-muted-foreground' : '')}>{status}</SidebarMenuBadge>
+                    <SidebarMenuAction onClick={() => props.onRequestDelete(s.key)} title="Eliminar">
+                      <Trash2 className="h-4 w-4" />
+                    </SidebarMenuAction>
+                  </SidebarMenuItem>
+                );
+              })}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel>
+            Presence <span className="text-muted-foreground">({props.presenceList.length})</span>
+          </SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {props.presenceList.slice(0, 12).map((p) => (
+                <SidebarMenuItem key={p.instanceId}>
+                  <SidebarMenuButton asChild tooltip={p.instanceId}>
+                    <div className="flex w-full items-center justify-between gap-2">
+                      <span className="truncate">{p.host}</span>
+                      <span className="text-xs text-muted-foreground">{p.mode}</span>
+                    </div>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+              {props.presenceList.length === 0 ? (
+                <SidebarMenuItem>
+                  <SidebarMenuButton asChild>
+                    <div className="text-xs text-muted-foreground">Sin presencia</div>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ) : null}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+
+      <SidebarFooter>
+        <div className="px-2 pb-2 text-xs text-muted-foreground">
+          WS: {wsText}
+          {props.presenceMeta.timestamp ? (
+            <>
+              <br />
+              presence ts: {new Date(props.presenceMeta.timestamp).toLocaleTimeString()}
+            </>
+          ) : null}
+        </div>
+      </SidebarFooter>
+    </Sidebar>
   );
 }
 
 function MessageBubble(props: { msg: ChatMessage }) {
   const m = props.msg;
-  const cls = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'tool';
+  const isUser = m.role === 'user';
+  const isTool = m.role === 'tool';
+
   return (
-    <div className={`bubble ${cls}`}>
-      <div className="bubble-meta">
-        {m.role} · {new Date(m.timestamp).toLocaleString()}
-        {m.model ? ` · ${m.model}` : ''}
+    <div
+      className={cn(
+        'rounded-lg border p-3',
+        isUser ? 'ml-auto bg-primary/10' : 'bg-card/30',
+        isTool ? 'border-dashed' : '',
+      )}
+    >
+      <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+        <span className="font-mono">{m.role}</span>
+        <span>·</span>
+        <span>{new Date(m.timestamp).toLocaleString()}</span>
+        {m.model ? (
+          <>
+            <span>·</span>
+            <span className="font-mono">{m.model}</span>
+          </>
+        ) : null}
+        {m.tokens?.input != null || m.tokens?.output != null ? (
+          <>
+            <span>·</span>
+            <span className="font-mono">
+              in {m.tokens?.input ?? '-'} / out {m.tokens?.output ?? '-'}
+            </span>
+          </>
+        ) : null}
+        {!isTool && m.role === 'assistant' ? <CheckCircle2 className="ml-auto h-3.5 w-3.5" /> : null}
       </div>
-      <div className="bubble-content">{m.content}</div>
+      <div className="whitespace-pre-wrap text-sm leading-relaxed">{m.content}</div>
     </div>
   );
+}
+
+function initials(username: string): string {
+  const clean = (username || '').trim();
+  if (!clean) return 'U';
+  const parts = clean.split(/\s+/g).filter(Boolean);
+  const first = parts[0]?.[0] ?? 'U';
+  const second = parts[1]?.[0] ?? parts[0]?.[1] ?? '';
+  return (first + second).toUpperCase();
 }
