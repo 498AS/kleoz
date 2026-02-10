@@ -6,7 +6,15 @@ import { OpenClawGatewayClient } from './openclaw/gatewayClient.js';
 import type { JwtClaims } from './types.js';
 
 const gateway = new OpenClawGatewayClient();
+if (!gateway.enabled()) {
+  console.error('[kleoz] Missing OpenClaw gateway auth. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD.');
+  process.exit(1);
+}
 gateway.start();
+await gateway.waitForConnected(15_000).catch((err) => {
+  console.error(`[kleoz] Failed to connect to OpenClaw gateway: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});
 const { app, hub } = buildApp(undefined, undefined, gateway);
 
 const port = Number(process.env.PORT ?? 3000);

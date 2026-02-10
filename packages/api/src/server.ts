@@ -375,59 +375,44 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub(), gat
       (agentId ? new RegExp(`@${agentId}\\b`, 'i').test(parsed.message) : false);
 
     if (mentionsAgent) {
-      if (openclaw.enabled()) {
-        openclaw.start();
-        runState.set(runId, { sessionKey, lastText: '' });
-        hub.emitToSession(sessionKey, { type: 'session.status', sessionKey, status: 'thinking' });
-
-        const cleaned = parsed.message
-          .replace(/@agent\b/gi, '')
-          .replace(agentId ? new RegExp(`@${agentId}\\b`, 'gi') : /^$/, '')
-          .trim();
-        const attachments = (parsed.attachments ?? []).map((a) => ({
-          type: a.type,
-          mimeType: a.mimeType,
-          fileName: a.filename,
-          content: a.data,
-        }));
-
-        openclaw
-          .request('chat.send', {
-            sessionKey,
-            message: cleaned || parsed.message,
-            deliver: false,
-            timeoutMs: 120_000,
-            idempotencyKey: runId,
-            attachments: attachments.length ? attachments : undefined,
-          })
-          .catch((err) => {
-            runState.delete(runId);
-            hub.emitToSession(sessionKey, { type: 'session.status', sessionKey, status: 'idle' });
-            hub.emitToSession(sessionKey, {
-              type: 'error',
-              sessionKey,
-              runId,
-              error: { code: 'GATEWAY_UNAVAILABLE', message: err instanceof Error ? err.message : String(err) },
-            });
-          });
-      } else {
-        const content = `Respuesta automática para: ${parsed.message.replace(/@agent/gi, '').trim()}`;
-        // Simulated streaming: 2 deltas + complete.
-        const mid = Math.max(1, Math.floor(content.length / 2));
-        hub.emitToSession(sessionKey, { type: 'message.delta', sessionKey, runId, delta: { content: content.slice(0, mid) } });
-        hub.emitToSession(sessionKey, { type: 'message.delta', sessionKey, runId, delta: { content: content.slice(mid) } });
-        const msg: ChatMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content,
-          timestamp: nowIso(),
-          model: 'mock',
-          tokens: { input: undefined, output: undefined },
-          metadata: { agentId: agentId ?? user.agentId },
-        };
-        store.appendRoomMessage(sessionKey, msg, { runId });
-        hub.emitToSession(sessionKey, { type: 'message.complete', sessionKey, runId, message: msg });
+      if (!openclaw.enabled()) {
+        return c.json(apiError('GATEWAY_UNAVAILABLE', 'OpenClaw gateway auth missing'), 503);
       }
+
+      openclaw.start();
+      runState.set(runId, { sessionKey, lastText: '' });
+      hub.emitToSession(sessionKey, { type: 'session.status', sessionKey, status: 'thinking' });
+
+      const cleaned = parsed.message
+        .replace(/@agent\b/gi, '')
+        .replace(agentId ? new RegExp(`@${agentId}\\b`, 'gi') : /^$/, '')
+        .trim();
+      const attachments = (parsed.attachments ?? []).map((a) => ({
+        type: a.type,
+        mimeType: a.mimeType,
+        fileName: a.filename,
+        content: a.data,
+      }));
+
+      openclaw
+        .request('chat.send', {
+          sessionKey,
+          message: cleaned || parsed.message,
+          deliver: false,
+          timeoutMs: 120_000,
+          idempotencyKey: runId,
+          attachments: attachments.length ? attachments : undefined,
+        })
+        .catch((err) => {
+          runState.delete(runId);
+          hub.emitToSession(sessionKey, { type: 'session.status', sessionKey, status: 'idle' });
+          hub.emitToSession(sessionKey, {
+            type: 'error',
+            sessionKey,
+            runId,
+            error: { code: 'GATEWAY_UNAVAILABLE', message: err instanceof Error ? err.message : String(err) },
+          });
+        });
     }
 
     return c.json({ ok: true, runId, status: 'accepted' });

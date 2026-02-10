@@ -48,6 +48,16 @@ export class OpenClawGatewayClient {
     return Boolean(config.gateway.token.trim() || config.gateway.password.trim());
   }
 
+  async waitForConnected(timeoutMs = 15_000): Promise<void> {
+    const t0 = Date.now();
+    while (!this.connected()) {
+      if (Date.now() - t0 > timeoutMs) {
+        throw new Error('gateway connect timeout');
+      }
+      await sleep(50);
+    }
+  }
+
   connected(): boolean {
     return Boolean(this.ws && this.ws.readyState === WebSocket.OPEN && this.connectedAtMs);
   }

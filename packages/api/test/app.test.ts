@@ -1,9 +1,66 @@
 import { describe, expect, it } from 'bun:test';
 import { buildApp } from '../src/server.js';
 import { SQLiteStore } from '../src/store.js';
+import { OpenClawGatewayClient } from '../src/openclaw/gatewayClient.js';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs/promises';
+
+class TestGateway extends OpenClawGatewayClient {
+  override enabled(): boolean {
+    return true;
+  }
+  override connected(): boolean {
+    return true;
+  }
+  override start(): void {
+    // no-op
+  }
+  override latencyMs(): number | undefined {
+    return 1;
+  }
+  override protocol(): number | undefined {
+    return 3;
+  }
+  override uptimeSeconds(): number {
+    return 123;
+  }
+  override async request<TPayload = unknown>(method: string, params?: unknown): Promise<TPayload> {
+    if (method !== 'chat.send') {
+      return {} as TPayload;
+    }
+    const p = params as any;
+    const runId = String(p.idempotencyKey);
+    const sessionKey = String(p.sessionKey);
+
+    // Emit a couple of deltas and a final, just like OpenClaw would.
+    queueMicrotask(() => {
+      this.onChatEvent?.({
+        runId,
+        sessionKey,
+        seq: 1,
+        state: 'delta',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'hola ' }], timestamp: Date.now() },
+      });
+      this.onChatEvent?.({
+        runId,
+        sessionKey,
+        seq: 2,
+        state: 'delta',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'hola mundo' }], timestamp: Date.now() },
+      });
+      this.onChatEvent?.({
+        runId,
+        sessionKey,
+        seq: 3,
+        state: 'final',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'hola mundo' }], timestamp: Date.now() },
+      });
+    });
+
+    return { runId, status: 'started' } as TPayload;
+  }
+}
 
 async function login(appFetch: (req: Request) => Promise<Response>, username = 'admin', password = 'admin1234') {
   const res = await appFetch(new Request('http://localhost/api/auth/login', {
@@ -28,7 +85,7 @@ describe('kleoz api', () => {
   it('responds from health endpoint', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'kleoz-test-'));
     const store = new SQLiteStore({ dataDir: tmp, dbPath: path.join(tmp, 'kleoz.db'), uploadsDir: path.join(tmp, 'uploads') });
-    const { app } = buildApp(store);
+    const { app } = buildApp(store, undefined, new TestGateway());
     const res = await app.request('/api/health');
     expect(res.status).toBe(200);
     const data = await res.json();
@@ -38,7 +95,7 @@ describe('kleoz api', () => {
   it('creates session and emits agent message only when @agent is present', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'kleoz-test-'));
     const store = new SQLiteStore({ dataDir: tmp, dbPath: path.join(tmp, 'kleoz.db'), uploadsDir: path.join(tmp, 'uploads') });
-    const { app } = buildApp(store);
+    const { app } = buildApp(store, undefined, new TestGateway());
     const token = await login(app.request.bind(app));
 
     await app.request('/api/messages/send', {
@@ -71,7 +128,7 @@ describe('kleoz api', () => {
   it('DM sessions auto-trigger the agent and are not joinable by other users', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'kleoz-test-'));
     const store = new SQLiteStore({ dataDir: tmp, dbPath: path.join(tmp, 'kleoz.db'), uploadsDir: path.join(tmp, 'uploads') });
-    const { app } = buildApp(store);
+    const { app } = buildApp(store, undefined, new TestGateway());
 
     const adminToken = await login(app.request.bind(app));
     await createUser(app.request.bind(app), adminToken, { username: 'u1', password: 'password123', agentId: 'main' });
