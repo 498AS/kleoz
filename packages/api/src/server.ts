@@ -157,10 +157,10 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
     return c.json({ ok: true });
   });
 
-  app.get('/api/agents', auth, onlyAdmin, (c) => {
-    return c.json({
-      agents: config.agents.allowed.map((id) => ({ id, name: id })),
-    });
+  app.get('/api/agents', auth, (c) => {
+    const user = c.get('user') as JwtClaims;
+    const allowed = store.listAllowedAgents({ userId: user.sub, isAdmin: user.role === 'admin', fallbackAgentId: user.agentId });
+    return c.json({ agents: allowed.map((id) => ({ id, name: id })) });
   });
 
   app.get('/api/agents/:agentId/config', auth, onlyAdmin, (c) => {
@@ -171,13 +171,14 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
 
   app.get('/api/sessions', auth, (c) => {
     const user = c.get('user') as JwtClaims;
+    const allowedAgents = store.listAllowedAgents({ userId: user.sub, isAdmin: user.role === 'admin', fallbackAgentId: user.agentId });
     const limit = Number(c.req.query('limit') ?? 50);
     const activeMinutes = c.req.query('activeMinutes') ? Number(c.req.query('activeMinutes')) : undefined;
     const kind = c.req.query('kind') as string | undefined;
     const { sessions, count } = store.listSessions({
       userId: user.sub,
       isAdmin: user.role === 'admin',
-      agentId: user.agentId,
+      allowedAgents,
       limit: Number.isFinite(limit) ? limit : 50,
       activeMinutes: activeMinutes && Number.isFinite(activeMinutes) ? activeMinutes : undefined,
       kind: kind && ['dm', 'group', 'channel'].includes(kind) ? (kind as any) : undefined,
@@ -203,8 +204,9 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
 
   app.get('/api/sessions/:sessionKey', auth, (c) => {
     const user = c.get('user') as JwtClaims;
+    const allowedAgents = store.listAllowedAgents({ userId: user.sub, isAdmin: user.role === 'admin', fallbackAgentId: user.agentId });
     const key = decodeURIComponent(c.req.param('sessionKey'));
-    const session = store.getSession(key, { userId: user.sub, isAdmin: user.role === 'admin', agentId: user.agentId });
+    const session = store.getSession(key, { userId: user.sub, isAdmin: user.role === 'admin', allowedAgents });
     if (!session) return c.json(apiError('NOT_FOUND', 'Session not found'), 404);
     return c.json({
       key: session.key,
@@ -225,6 +227,7 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
 
   app.get('/api/sessions/:sessionKey/history', auth, (c) => {
     const user = c.get('user') as JwtClaims;
+    const allowedAgents = store.listAllowedAgents({ userId: user.sub, isAdmin: user.role === 'admin', fallbackAgentId: user.agentId });
     const key = decodeURIComponent(c.req.param('sessionKey'));
     const limit = Number(c.req.query('limit') ?? 100);
     const includeTools = (c.req.query('includeTools') ?? 'false') === 'true';
@@ -233,7 +236,7 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
     const out = store.getSessionHistory(key, {
       userId: user.sub,
       isAdmin: user.role === 'admin',
-      agentId: user.agentId,
+      allowedAgents,
       limit: Number.isFinite(limit) ? limit : 100,
       includeTools,
       before,
@@ -244,8 +247,9 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
 
   app.delete('/api/sessions/:sessionKey', auth, onlyAdmin, (c) => {
     const user = c.get('user') as JwtClaims;
+    const allowedAgents = store.listAllowedAgents({ userId: user.sub, isAdmin: true, fallbackAgentId: user.agentId });
     const key = decodeURIComponent(c.req.param('sessionKey'));
-    const out = store.deleteSession(key, { userId: user.sub, isAdmin: user.role === 'admin', agentId: user.agentId });
+    const out = store.deleteSession(key, { userId: user.sub, isAdmin: true, allowedAgents });
     if (!out) return c.json(apiError('NOT_FOUND', 'Session not found'), 404);
     hub.emitToSession(key, { type: 'session.deleted', sessionKey: key });
     return c.json(out);
@@ -255,22 +259,51 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
     const parsed = sendSchema.parse(await c.req.json());
     const user = c.get('user') as JwtClaims;
     const sessionKey = parsed.sessionKey;
-    const session = store.ensureSession(sessionKey, { userId: user.sub, isAdmin: user.role === 'admin', agentId: user.agentId });
-    if (!session) return c.json(apiError('FORBIDDEN', 'Forbidden'), 403);
+    const allowedAgents = store.listAllowedAgents({ userId: user.sub, isAdmin: user.role === 'admin', fallbackAgentId: user.agentId });
+    const ensured = store.ensureSession(sessionKey, { userId: user.sub, isAdmin: user.role === 'admin', allowedAgents });
+    if (!ensured) return c.json(apiError('FORBIDDEN', 'Forbidden'), 403);
+    const session = ensured.session;
+    const agentId = /^agent:([^:]+):/.exec(sessionKey)?.[1];
+
+    if (ensured.created && session.kind !== 'dm' && agentId) {
+      hub.emitToAgent(agentId, {
+        type: 'session.created',
+        session: {
+          key: session.key,
+          sessionId: session.sessionId,
+          kind: session.kind,
+          channel: session.channel ?? 'unknown',
+          displayName: session.displayName,
+          updatedAt: session.updatedAt,
+          model: session.model,
+          totalTokens: session.totalTokens,
+          contextTokens: session.contextTokens,
+        },
+      });
+    }
 
     const runId = crypto.randomUUID();
+    const now = nowIso();
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
       content: parsed.message,
-      timestamp: nowIso(),
+      timestamp: now,
       metadata: { username: user.username, userId: user.sub, attachments: parsed.attachments ?? [] },
     };
-    store.appendToTranscript(sessionKey, userMsg);
+    store.appendRoomMessage(sessionKey, userMsg, { runId });
     hub.emitToSession(sessionKey, { type: 'message.complete', sessionKey, runId, message: userMsg });
     hub.emitToSession(sessionKey, { type: 'session.updated', sessionKey, changes: { updatedAt: Date.now() } });
+    if (session.kind !== 'dm' && agentId) {
+      hub.emitToAgent(agentId, { type: 'session.updated', sessionKey, changes: { updatedAt: Date.now() } });
+    }
 
-    const mentionsAgent = /@agent\b/i.test(parsed.message);
+    const isDm = session.kind === 'dm';
+    const mentionsAgent =
+      isDm ||
+      /@agent\b/i.test(parsed.message) ||
+      (agentId ? new RegExp(`@${agentId}\\b`, 'i').test(parsed.message) : false);
+
     if (mentionsAgent) {
       const content = `Respuesta automática para: ${parsed.message.replace(/@agent/gi, '').trim()}`;
       // Simulated streaming: 2 deltas + complete.
@@ -284,9 +317,9 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
         timestamp: nowIso(),
         model: 'mock',
         tokens: { input: undefined, output: undefined },
-        metadata: { agentId: user.agentId },
+        metadata: { agentId: agentId ?? user.agentId },
       };
-      store.appendToTranscript(sessionKey, msg);
+      store.appendRoomMessage(sessionKey, msg, { runId });
       hub.emitToSession(sessionKey, { type: 'message.complete', sessionKey, runId, message: msg });
     }
 

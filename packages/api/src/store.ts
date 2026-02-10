@@ -54,8 +54,6 @@ function apiUploadUrl(id: string): string {
   return `/api/uploads/${encodeURIComponent(id)}`;
 }
 
-type Access = { userId: string; isAdmin: boolean; agentId: string };
-
 export class SQLiteStore {
   private db: SQLiteDb;
   private dbPath: string;
@@ -79,6 +77,8 @@ export class SQLiteStore {
     this.db = new DatabaseSync(this.dbPath);
     this.migrate();
     this.ensureAdminUser();
+    this.backfillUserAgentsFromUsers();
+    this.backfillDmMembershipFromParticipants();
     this.gcUploads().catch(() => {});
   }
 
@@ -95,6 +95,14 @@ export class SQLiteStore {
         last_login_at INTEGER
       );
 
+      CREATE TABLE IF NOT EXISTS user_agents (
+        user_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, agent_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_agents_user ON user_agents(user_id);
+
       CREATE TABLE IF NOT EXISTS sessions (
         key TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -109,6 +117,30 @@ export class SQLiteStore {
         transcript_path TEXT NOT NULL,
         participants_json TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+
+      CREATE TABLE IF NOT EXISTS session_members (
+        session_key TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'member',
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (session_key, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_members_user ON session_members(user_id);
+
+      CREATE TABLE IF NOT EXISTS room_messages (
+        id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        run_id TEXT,
+        model TEXT,
+        tokens_json TEXT,
+        metadata_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_room_messages_session_created ON room_messages(session_key, created_at_ms);
 
       CREATE TABLE IF NOT EXISTS uploads (
         id TEXT PRIMARY KEY,
@@ -123,7 +155,14 @@ export class SQLiteStore {
 
   private ensureAdminUser(): void {
     const row = this.db.prepare(`SELECT id FROM users WHERE username = ?`).get(config.auth.adminUsername) as { id: string } | undefined;
-    if (row?.id) return;
+    if (row?.id) {
+      const now = Date.now();
+      // Ensure the admin is usable with agent filtering even on upgraded DBs.
+      const agentRow = this.db.prepare(`SELECT agent_id as agentId FROM users WHERE id = ?`).get(row.id) as any;
+      const agentId = agentRow?.agentId ? String(agentRow.agentId) : 'main';
+      this.db.prepare(`INSERT OR IGNORE INTO user_agents (user_id, agent_id, created_at) VALUES (?, ?, ?)`).run(row.id, agentId, now);
+      return;
+    }
     const id = crypto.randomUUID();
     const now = Date.now();
     this.db
@@ -132,6 +171,41 @@ export class SQLiteStore {
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
       )
       .run(id, config.auth.adminUsername, bcrypt.hashSync(config.auth.adminPassword, 10), 'main', 'admin', now, now);
+    this.db.prepare(`INSERT OR IGNORE INTO user_agents (user_id, agent_id, created_at) VALUES (?, ?, ?)`).run(id, 'main', now);
+  }
+
+  private backfillUserAgentsFromUsers(): void {
+    const now = Date.now();
+    const rows = this.db.prepare(`SELECT id, agent_id as agentId FROM users`).all() as any[];
+    for (const r of rows) {
+      const userId = String(r.id);
+      const agentId = String(r.agentId ?? '').trim();
+      if (!userId || !agentId) continue;
+      this.db.prepare(`INSERT OR IGNORE INTO user_agents (user_id, agent_id, created_at) VALUES (?, ?, ?)`).run(userId, agentId, now);
+    }
+  }
+
+  private backfillDmMembershipFromParticipants(): void {
+    const now = Date.now();
+    const rows = this.db
+      .prepare(`SELECT key as sessionKey, participants_json as participantsJson FROM sessions WHERE kind = 'dm'`)
+      .all() as any[];
+    for (const r of rows) {
+      const sessionKey = String(r.sessionKey ?? '').trim();
+      if (!sessionKey) continue;
+      let participants: unknown = [];
+      try {
+        participants = JSON.parse(String(r.participantsJson ?? '[]'));
+      } catch {
+        participants = [];
+      }
+      const ids = Array.isArray(participants) ? participants.map((x) => String(x)).filter(Boolean) : [];
+      for (const userId of ids) {
+        this.db
+          .prepare(`INSERT OR IGNORE INTO session_members (session_key, user_id, role, created_at) VALUES (?, ?, 'member', ?)`)
+          .run(sessionKey, userId, now);
+      }
+    }
   }
 
   // --- Users
@@ -187,6 +261,7 @@ export class SQLiteStore {
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
       )
       .run(user.id, user.username, user.passwordHash, user.agentId, user.role, user.createdAt, user.updatedAt);
+    this.db.prepare(`INSERT OR IGNORE INTO user_agents (user_id, agent_id, created_at) VALUES (?, ?, ?)`).run(user.id, user.agentId, now);
     return user;
   }
 
@@ -203,6 +278,9 @@ export class SQLiteStore {
         `UPDATE users SET username = ?, password_hash = ?, role = ?, agent_id = ?, updated_at = ? WHERE id = ?`,
       )
       .run(username, passwordHash, role, agentId, now, userId);
+    if (patch.agentId) {
+      this.db.prepare(`INSERT OR IGNORE INTO user_agents (user_id, agent_id, created_at) VALUES (?, ?, ?)`).run(userId, agentId, now);
+    }
     return true;
   }
 
@@ -223,28 +301,83 @@ export class SQLiteStore {
 
   // --- Sessions
 
-  ensureSession(sessionKey: string, access: Access): Session | null {
+  listAllowedAgents(access: { userId: string; isAdmin: boolean; fallbackAgentId: string }): string[] {
+    if (access.isAdmin) return config.agents.allowed.slice();
+    const rows = this.db.prepare(`SELECT agent_id as agentId FROM user_agents WHERE user_id = ?`).all(access.userId) as any[];
+    const agents = rows.map((r) => String(r.agentId)).filter(Boolean);
+    const base = agents.length > 0 ? agents : [access.fallbackAgentId];
+    return base.filter((id) => config.agents.allowed.includes(id));
+  }
+
+  private isDmSessionKey(sessionKey: string): boolean {
+    return sessionKind(sessionKey) === 'dm';
+  }
+
+  private canAccessSession(sessionKey: string, access: { userId: string; isAdmin: boolean; allowedAgents: string[] }): boolean {
+    if (access.isAdmin) return true;
     const agent = sessionAgentId(sessionKey);
-    if (!access.isAdmin) {
-      if (agent && agent !== access.agentId) return null;
-      if (agent && !config.agents.allowed.includes(agent)) return null;
+    if (!agent) return false;
+    if (!config.agents.allowed.includes(agent)) return false;
+    if (!access.allowedAgents.includes(agent)) return false;
+    if (this.isDmSessionKey(sessionKey)) {
+      const row = this.db.prepare(`SELECT 1 as ok FROM session_members WHERE session_key = ? AND user_id = ?`).get(sessionKey, access.userId) as any;
+      return Boolean(row?.ok);
+    }
+    // Non-DM sessions are visible to all users assigned to the agent.
+    return true;
+  }
+
+  ensureSession(
+    sessionKey: string,
+    access: { userId: string; isAdmin: boolean; allowedAgents: string[] },
+  ): { session: Session; created: boolean } | null {
+    const existingRow = this.db
+      .prepare(
+        `SELECT key, session_id as sessionId, kind, channel, display_name as displayName, created_at as createdAt, updated_at as updatedAt, model, total_tokens as totalTokens, context_tokens as contextTokens, transcript_path as transcriptPath
+         FROM sessions WHERE key = ?`,
+      )
+      .get(sessionKey) as any;
+
+    if (existingRow) {
+      // Session exists: do not allow implicit "join" to DM by guessing key.
+      if (!this.canAccessSession(sessionKey, access)) return null;
+      const session: Session = {
+        key: String(existingRow.key),
+        sessionId: String(existingRow.sessionId),
+        kind: existingRow.kind,
+        channel: existingRow.channel,
+        displayName: existingRow.displayName ?? undefined,
+        createdAt: Number(existingRow.createdAt),
+        updatedAt: Number(existingRow.updatedAt),
+        model: existingRow.model ?? undefined,
+        totalTokens: existingRow.totalTokens ?? undefined,
+        contextTokens: existingRow.contextTokens ?? undefined,
+        transcriptPath: String(existingRow.transcriptPath),
+        participants: [],
+      };
+      return { session, created: false };
     }
 
-    const existing = this.getSession(sessionKey, access);
-    if (existing) return existing as any;
+    // New session: validate agent access.
+    if (!access.isAdmin) {
+      const agent = sessionAgentId(sessionKey);
+      if (!agent) return null;
+      if (!config.agents.allowed.includes(agent)) return null;
+      if (!access.allowedAgents.includes(agent)) return null;
+    }
 
-    // Create new session owned by this user.
     const now = Date.now();
+    const kind = sessionKind(sessionKey);
     const session: Session = {
       key: sessionKey,
       sessionId: crypto.randomUUID(),
-      kind: sessionKind(sessionKey),
+      kind,
       channel: sessionChannel(sessionKey),
       displayName: sessionKey.split(':').slice(-1)[0] ?? sessionKey,
       createdAt: now,
       updatedAt: now,
       transcriptPath: transcriptRelPath(sessionKey),
-      participants: [access.userId],
+      participants: [],
     };
 
     ensureDir(path.dirname(path.resolve(this.dataDir, session.transcriptPath)));
@@ -265,13 +398,19 @@ export class SQLiteStore {
         session.createdAt,
         session.updatedAt,
         session.transcriptPath,
-        JSON.stringify(session.participants),
+        JSON.stringify([]),
       );
 
-    return session;
+    if (kind === 'dm') {
+      this.db
+        .prepare(`INSERT OR IGNORE INTO session_members (session_key, user_id, role, created_at) VALUES (?, ?, 'member', ?)`)
+        .run(sessionKey, access.userId, now);
+    }
+
+    return { session, created: true };
   }
 
-  listSessions(opts: { userId: string; isAdmin: boolean; agentId: string; limit: number; activeMinutes?: number; kind?: 'dm' | 'group' | 'channel' }): {
+  listSessions(opts: { userId: string; isAdmin: boolean; allowedAgents: string[]; limit: number; activeMinutes?: number; kind?: 'dm' | 'group' | 'channel' }): {
     sessions: Omit<Session, 'participants' | 'createdAt'>[];
     count: number;
   } {
@@ -279,8 +418,15 @@ export class SQLiteStore {
     const params: unknown[] = [];
 
     if (!opts.isAdmin) {
-      where.push(`key LIKE ?`);
-      params.push(`agent:${opts.agentId}:%`);
+      if (opts.allowedAgents.length === 0) {
+        return { sessions: [], count: 0 };
+      }
+      const agentWheres = opts.allowedAgents.map(() => `key LIKE ?`).join(' OR ');
+      where.push(`(${agentWheres})`);
+      for (const a of opts.allowedAgents) params.push(`agent:${a}:%`);
+      // For DM sessions, require membership; non-DM sessions are visible to all users on that agent.
+      where.push(`(kind != 'dm' OR key IN (SELECT session_key FROM session_members WHERE user_id = ?))`);
+      params.push(opts.userId);
     }
     if (opts.activeMinutes && Number.isFinite(opts.activeMinutes)) {
       where.push(`updated_at >= ?`);
@@ -306,7 +452,7 @@ export class SQLiteStore {
     return { sessions: rows, count: countRow.n ?? rows.length };
   }
 
-  getSession(sessionKey: string, access: Access): (Omit<Session, 'participants'> & { participants: string[] }) | undefined {
+  getSession(sessionKey: string, access: { userId: string; isAdmin: boolean; allowedAgents: string[] }): (Omit<Session, 'participants'> & { participants: string[] }) | undefined {
     const row = this.db
       .prepare(
         `SELECT key, session_id as sessionId, kind, channel, display_name as displayName, created_at as createdAt, updated_at as updatedAt, model, total_tokens as totalTokens, context_tokens as contextTokens, transcript_path as transcriptPath, participants_json as participantsJson
@@ -314,12 +460,11 @@ export class SQLiteStore {
       )
       .get(sessionKey) as any;
     if (!row) return undefined;
-    const participants = JSON.parse(row.participantsJson ?? '[]') as string[];
-    const agent = sessionAgentId(sessionKey);
-    if (!access.isAdmin) {
-      if (agent && agent !== access.agentId) return undefined;
-      if (agent && !config.agents.allowed.includes(agent)) return undefined;
-    }
+    if (!this.canAccessSession(sessionKey, access)) return undefined;
+    const participants =
+      row.kind === 'dm'
+        ? ((this.db.prepare(`SELECT user_id as userId FROM session_members WHERE session_key = ?`).all(sessionKey) as any[]).map((r) => String(r.userId)))
+        : [];
     return {
       key: row.key,
       sessionId: row.sessionId,
@@ -336,10 +481,10 @@ export class SQLiteStore {
     };
   }
 
-  deleteSession(sessionKey: string, access: Access): { ok: true; deleted: { sessionKey: string; transcriptDeleted: boolean } } | null {
+  deleteSession(sessionKey: string, access: { userId: string; isAdmin: boolean; allowedAgents: string[] }): { ok: true; deleted: { sessionKey: string; transcriptDeleted: boolean; messagesDeleted: number } } | null {
     const s = this.getSession(sessionKey, access);
     if (!s) return null;
-    if (!access.isAdmin && !s.participants.includes(access.userId)) return null;
+    if (!access.isAdmin) return null;
     const abs = path.resolve(this.dataDir, s.transcriptPath);
     let transcriptDeleted = false;
     try {
@@ -348,8 +493,10 @@ export class SQLiteStore {
     } catch {
       transcriptDeleted = false;
     }
+    const delMsgs = this.db.prepare(`DELETE FROM room_messages WHERE session_key = ?`).run(sessionKey) as any;
+    this.db.prepare(`DELETE FROM session_members WHERE session_key = ?`).run(sessionKey);
     this.db.prepare(`DELETE FROM sessions WHERE key = ?`).run(sessionKey);
-    return { ok: true, deleted: { sessionKey, transcriptDeleted } };
+    return { ok: true, deleted: { sessionKey, transcriptDeleted, messagesDeleted: delMsgs.changes ?? 0 } };
   }
 
   countSessions(): { total: number; active: number } {
@@ -358,52 +505,75 @@ export class SQLiteStore {
     return { total: totalRow.n ?? 0, active: activeRow.n ?? 0 };
   }
 
-  // --- Transcript / History
+  // --- Room Messages
 
-  appendToTranscript(sessionKey: string, msg: ChatMessage): void {
-    const s = this.getSession(sessionKey, { userId: 'internal', isAdmin: true, agentId: 'internal' });
-    const rel = s?.transcriptPath ?? transcriptRelPath(sessionKey);
-    const abs = path.resolve(this.dataDir, rel);
-    ensureDir(path.dirname(abs));
-    fs.appendFileSync(abs, `${JSON.stringify(msg)}\n`, 'utf8');
-    this.db.prepare(`UPDATE sessions SET updated_at = ? WHERE key = ?`).run(Date.now(), sessionKey);
+  appendRoomMessage(sessionKey: string, msg: ChatMessage, opts?: { runId?: string }): void {
+    const nowMs = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO room_messages (id, session_key, role, content, timestamp, created_at_ms, run_id, model, tokens_json, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        msg.id,
+        sessionKey,
+        msg.role,
+        msg.content,
+        msg.timestamp,
+        nowMs,
+        opts?.runId ?? null,
+        msg.model ?? null,
+        msg.tokens ? JSON.stringify(msg.tokens) : null,
+        msg.metadata ? JSON.stringify(msg.metadata) : null,
+      );
+    this.db.prepare(`UPDATE sessions SET updated_at = ? WHERE key = ?`).run(nowMs, sessionKey);
   }
 
   getSessionHistory(
     sessionKey: string,
-    opts: Access & { limit: number; includeTools: boolean; before?: string },
+    opts: { userId: string; isAdmin: boolean; allowedAgents: string[]; limit: number; includeTools: boolean; before?: string },
   ): { messages: ChatMessage[]; hasMore: boolean; nextCursor?: string } | null {
-    const s = this.getSession(sessionKey, opts);
-    if (!s) return null;
-    const abs = path.resolve(this.dataDir, s.transcriptPath);
-    if (!fs.existsSync(abs)) return { messages: [], hasMore: false };
-    const raw = fs.readFileSync(abs, 'utf8');
-    const lines = raw
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    let msgs: ChatMessage[] = [];
-    for (const line of lines) {
-      try {
-        const m = JSON.parse(line) as ChatMessage;
-        if (!opts.includeTools && m.role === 'tool') continue;
-        msgs.push(m);
-      } catch {
-        // ignore malformed line
-      }
+    if (!this.canAccessSession(sessionKey, { userId: opts.userId, isAdmin: opts.isAdmin, allowedAgents: opts.allowedAgents })) return null;
+    const sessionRow = this.db.prepare(`SELECT 1 as ok FROM sessions WHERE key = ?`).get(sessionKey) as any;
+    if (!sessionRow?.ok) return null;
+
+    let beforeMs: number | undefined;
+    if (opts.before) {
+      const row = this.db.prepare(`SELECT created_at_ms as ms FROM room_messages WHERE id = ? AND session_key = ?`).get(opts.before, sessionKey) as any;
+      if (row?.ms && Number.isFinite(row.ms)) beforeMs = Number(row.ms);
     }
 
-    // Pagination: "before" is message id (exclusive).
-    let end = msgs.length;
-    if (opts.before) {
-      const idx = msgs.findIndex((m) => m.id === opts.before);
-      if (idx >= 0) end = idx;
-    }
-    const slice = msgs.slice(0, end);
-    const start = Math.max(0, slice.length - opts.limit);
-    const page = slice.slice(start);
-    const hasMore = start > 0;
-    const nextCursor = hasMore ? page[0]?.id : undefined;
+    const limit = Math.max(1, Math.min(1000, opts.limit));
+    const rows = this.db
+      .prepare(
+        `SELECT id, role, content, timestamp, model, tokens_json as tokensJson, metadata_json as metadataJson, created_at_ms as createdAtMs
+         FROM room_messages
+         WHERE session_key = ?
+           AND (? IS NULL OR created_at_ms < ?)
+         ORDER BY created_at_ms DESC
+         LIMIT ?`,
+      )
+      .all(sessionKey, beforeMs ?? null, beforeMs ?? null, limit + 1) as any[];
+
+    const mapped = rows
+      .map((r) => {
+        const role = String(r.role) as ChatMessage['role'];
+        if (!opts.includeTools && role === 'tool') return null;
+        return {
+          id: String(r.id),
+          role,
+          content: String(r.content),
+          timestamp: String(r.timestamp),
+          model: r.model ? String(r.model) : undefined,
+          tokens: r.tokensJson ? (JSON.parse(String(r.tokensJson)) as any) : undefined,
+          metadata: r.metadataJson ? (JSON.parse(String(r.metadataJson)) as any) : undefined,
+        } satisfies ChatMessage;
+      })
+      .filter(Boolean) as ChatMessage[];
+
+    const hasMore = mapped.length > limit;
+    const page = mapped.slice(0, limit).reverse(); // chronological
+    const nextCursor = hasMore ? mapped[limit - 1]?.id : undefined;
     return { messages: page, hasMore, nextCursor };
   }
 

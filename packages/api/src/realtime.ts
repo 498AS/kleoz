@@ -69,6 +69,14 @@ export class RealtimeHub {
     }
   }
 
+  emitToAgent(agentId: string, event: object): void {
+    for (const [socket, meta] of this.sockets.entries()) {
+      if (meta.agentId === agentId) {
+        socket.send(JSON.stringify(event));
+      }
+    }
+  }
+
   onlineUserCount(): number {
     return new Set(Array.from(this.sockets.values()).map((s) => s.userId)).size;
   }
