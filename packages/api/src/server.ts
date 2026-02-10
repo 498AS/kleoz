@@ -2,7 +2,6 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import type { Context, Next } from 'hono';
-import type { WebSocketServer } from 'ws';
 import { SQLiteStore } from './store.js';
 import { revokeToken, signToken, verifyToken } from './auth.js';
 import type { ChatMessage, JwtClaims, Variables } from './types.js';
@@ -476,24 +475,4 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub(), gat
   });
 
   return { app, store, hub };
-}
-
-export function attachWsHandlers(wss: WebSocketServer, hub: RealtimeHub) {
-  wss.on('connection', (ws, claims: JwtClaims) => {
-    hub.register(ws, { userId: claims.sub, username: claims.username, agentId: claims.agentId });
-    ws.on('message', (raw) => {
-      try {
-        hub.noteInput(ws);
-        const data = JSON.parse(raw.toString()) as { type?: string; sessionKeys?: string[]; token?: string; client?: { instanceId?: string; version?: string; platform?: string; mode?: string } };
-        if (data.type === 'connect' && data.client) hub.updateClient(ws, data.client);
-        if (data.type === 'subscribe' || data.type === 'sessions.subscribe') hub.setSubscriptions(ws, data.sessionKeys ?? []);
-        if (data.type === 'unsubscribe') hub.removeSubscriptions(ws, data.sessionKeys ?? []);
-        if (data.type === 'subscribe.presence') hub.enablePresence(ws);
-      } catch {
-        ws.send(JSON.stringify(apiError('INVALID_REQUEST', 'Malformed message')));
-      }
-    });
-    ws.on('close', () => hub.unregister(ws));
-    ws.send(JSON.stringify({ type: 'connected', wsSessionId: crypto.randomUUID() }));
-  });
 }

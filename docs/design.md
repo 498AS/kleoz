@@ -293,7 +293,7 @@ Ver [security.md](security.md) para detalles completos.
 ### Unit Tests
 
 ```typescript
-// Vitest para lógica de negocio
+// bun:test para lógica de negocio
 describe('UserService', () => {
   it('should hash password correctly', async () => {
     const hash = await hashPassword('test123');
@@ -329,7 +329,7 @@ describe('POST /api/auth/login', () => {
 
 ### Requisitos
 
-- Node.js 22+
+- Bun 1.3+
 - OpenClaw Gateway en el mismo servidor
 - Puerto 3000 (configurable)
 - ~100MB RAM
@@ -338,12 +338,12 @@ describe('POST /api/auth/login', () => {
 ### Docker
 
 ```dockerfile
-FROM node:22-alpine
+FROM oven/bun:alpine
 WORKDIR /app
 COPY . .
-RUN npm ci && npm run build
+RUN bun install --frozen-lockfile && bun run build
 EXPOSE 3000
-CMD ["node", "dist/api/index.js"]
+CMD ["bun", "packages/api/dist/start.js"]
 ```
 
 ### Variables de Entorno

@@ -9,10 +9,11 @@ Implementación funcional inicial de **kleoz** con foco en:
 
 ## Stack implementado
 
+- **Runtime**: Bun.
 - **Backend**: Hono + WebSocket + TypeScript.
 - **Frontend**: React + Vite + TypeScript.
 - **Auth**: JWT con usuario admin por defecto (`admin` / `admin1234`).
-- **Persistencia**: In-memory (base lista para evolucionar a SQLite).
+- **Persistencia**: SQLite (via `bun:sqlite`) + uploads en disco.
 
 ## Estructura
 
@@ -22,8 +23,8 @@ Implementación funcional inicial de **kleoz** con foco en:
 ## Desarrollo
 
 ```bash
-npm install
-npm run dev
+bun install
+bun run dev
 ```
 
 - API: `http://localhost:3000`
@@ -32,7 +33,7 @@ npm run dev
 ## Tests
 
 ```bash
-npm test
+bun run test
 ```
 
 ## Estado del proyecto

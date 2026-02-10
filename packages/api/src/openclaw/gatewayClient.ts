@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import WebSocket from 'ws';
 import { config } from '../config.js';
 
 type GatewayFrame =
@@ -100,7 +99,7 @@ export class OpenClawGatewayClient {
 
   private async connectOnce(): Promise<void> {
     const url = config.gateway.url;
-    const ws = new WebSocket(url, { maxPayload: 25 * 1024 * 1024 });
+    const ws = new WebSocket(url);
     this.ws = ws;
 
     await new Promise<void>((resolve, reject) => {

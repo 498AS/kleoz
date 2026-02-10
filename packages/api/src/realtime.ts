@@ -1,4 +1,3 @@
-import type { WebSocket } from 'ws';
 import type { PresenceEntry } from './types.js';
 
 interface SocketMeta {
@@ -12,34 +11,38 @@ interface SocketMeta {
   lastInputAt: number;
 }
 
-export class RealtimeHub {
-  private sockets = new Map<WebSocket, SocketMeta>();
+export type HubSocket = {
+  send: (data: string) => unknown;
+};
 
-  register(ws: WebSocket, meta: Pick<SocketMeta, 'userId' | 'username' | 'agentId'>): void {
+export class RealtimeHub {
+  private sockets = new Map<HubSocket, SocketMeta>();
+
+  register(ws: HubSocket, meta: Pick<SocketMeta, 'userId' | 'username' | 'agentId'>): void {
     const now = Date.now();
     this.sockets.set(ws, { ...meta, subscriptions: new Set(), presenceEnabled: false, instanceId: crypto.randomUUID(), connectedAt: now, lastInputAt: now });
   }
 
-  unregister(ws: WebSocket): void {
+  unregister(ws: HubSocket): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     this.sockets.delete(ws);
     this.broadcastPresenceLeft(meta.instanceId);
   }
 
-  setSubscriptions(ws: WebSocket, sessionKeys: string[]): void {
+  setSubscriptions(ws: HubSocket, sessionKeys: string[]): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     meta.subscriptions = new Set(sessionKeys);
   }
 
-  removeSubscriptions(ws: WebSocket, sessionKeys: string[]): void {
+  removeSubscriptions(ws: HubSocket, sessionKeys: string[]): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     for (const k of sessionKeys) meta.subscriptions.delete(k);
   }
 
-  enablePresence(ws: WebSocket): void {
+  enablePresence(ws: HubSocket): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     meta.presenceEnabled = true;
@@ -47,7 +50,7 @@ export class RealtimeHub {
     this.broadcastPresenceJoined(meta);
   }
 
-  updateClient(ws: WebSocket, client: { instanceId?: string; version?: string; platform?: string; mode?: string }): void {
+  updateClient(ws: HubSocket, client: { instanceId?: string; version?: string; platform?: string; mode?: string }): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     if (client.instanceId && typeof client.instanceId === 'string') {
@@ -55,7 +58,7 @@ export class RealtimeHub {
     }
   }
 
-  noteInput(ws: WebSocket): void {
+  noteInput(ws: HubSocket): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     meta.lastInputAt = Date.now();

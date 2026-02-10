@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import bcrypt from 'bcryptjs';
+import { Database } from 'bun:sqlite';
 
 import { config } from './config.js';
 import type { ChatMessage, Role, Session, User } from './types.js';
@@ -18,8 +18,13 @@ type SQLiteDb = {
   prepare: (sql: string) => SQLiteStmt;
 };
 
-const require = createRequire(import.meta.url);
-const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: new (path: string) => SQLiteDb };
+function loadSqliteDb(dbPath: string): SQLiteDb {
+  const db = new Database(dbPath);
+  return {
+    exec: (sql: string) => db.exec(sql),
+    prepare: (sql: string) => db.query(sql) as unknown as SQLiteStmt,
+  };
+}
 
 function ensureDir(p: string): void {
   fs.mkdirSync(p, { recursive: true });
@@ -74,7 +79,7 @@ export class SQLiteStore {
       : process.env.DATABASE_PATH
         ? path.resolve(process.env.DATABASE_PATH)
         : path.resolve(this.dataDir, 'kleoz.db');
-    this.db = new DatabaseSync(this.dbPath);
+    this.db = loadSqliteDb(this.dbPath);
     this.migrate();
     this.ensureAdminUser();
     this.backfillUserAgentsFromUsers();

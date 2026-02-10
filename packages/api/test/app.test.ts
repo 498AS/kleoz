@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildApp } from '../src/server.js';
 import { SQLiteStore } from '../src/store.js';
 import path from 'node:path';
