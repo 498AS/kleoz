@@ -1,9 +1,6 @@
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 import { config } from '../config.js';
-import { buildDeviceAuthPayload } from './deviceAuth.js';
-import { loadOrCreateDeviceIdentity, publicKeyRawBase64UrlFromPem, signDevicePayload } from './deviceIdentity.js';
 
 type GatewayFrame =
   | { type: 'req'; id: string; method: string; params?: unknown }
@@ -170,15 +167,6 @@ export class OpenClawGatewayClient {
         const nonce = (parsed.payload as any)?.nonce;
         if (typeof nonce === 'string' && nonce.trim()) {
           this.connectNonce = nonce.trim();
-          // If connect is waiting, cancel it; sendConnect() will retry with the nonce.
-          if (this.connectReqId) {
-            const p = this.pending.get(this.connectReqId);
-            if (p) {
-              this.pending.delete(this.connectReqId);
-              p.reject(new Error('connect challenged'));
-            }
-            this.connectReqId = null;
-          }
         }
         return;
       }
@@ -224,76 +212,39 @@ export class OpenClawGatewayClient {
     const password = config.gateway.password.trim();
     const scopes = ['operator.admin'];
     const role = 'operator';
-    const clientId = 'kleoz-backend';
+    // OpenClaw validates client.id/client.mode against its protocol enums.
+    const clientId = 'gateway-client';
     const clientMode = 'backend';
-    const signedAtMs = Date.now();
-
-    const identityPath = path.resolve(config.dataDir, 'openclaw-device.json');
-    const identity = loadOrCreateDeviceIdentity(identityPath);
-    const nonce = this.connectNonce ?? undefined;
-    const payload = buildDeviceAuthPayload({
-      deviceId: identity.deviceId,
-      clientId,
-      clientMode,
-      role,
-      scopes,
-      signedAtMs,
-      token: token || null,
-      nonce,
-    });
-    const signature = signDevicePayload(identity.privateKeyPem, payload);
-    const device = {
-      id: identity.deviceId,
-      publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
-      signature,
-      signedAt: signedAtMs,
-      nonce,
+    const reqId = randomUUID();
+    this.connectReqId = reqId;
+    const frame: GatewayFrame = {
+      type: 'req',
+      id: reqId,
+      method: 'connect',
+      params: {
+        minProtocol: 3,
+        maxProtocol: 3,
+        client: {
+          id: clientId,
+          displayName: 'kleoz',
+          version: config.version,
+          platform: process.platform,
+          mode: clientMode,
+          instanceId: this.instanceId,
+        },
+        role,
+        scopes,
+        auth: token || password ? { token: token || undefined, password: password || undefined } : undefined,
+      },
     };
 
-    // connect can be challenged with a nonce; retry in-place without reconnecting the socket.
-    for (;;) {
-      const reqId = randomUUID();
-      this.connectReqId = reqId;
-      const frame: GatewayFrame = {
-        type: 'req',
-        id: reqId,
-        method: 'connect',
-        params: {
-          minProtocol: 3,
-          maxProtocol: 3,
-          client: {
-            id: clientId,
-            displayName: 'kleoz',
-            version: config.version,
-            platform: process.platform,
-            mode: clientMode,
-            instanceId: this.instanceId,
-          },
-          role,
-          scopes,
-          device,
-          auth: token || password ? { token: token || undefined, password: password || undefined } : undefined,
-        },
-      };
-
-      try {
-        const hello = await this.sendAndWait(frame);
-        const protocol = (hello as any)?.protocol;
-        if (typeof protocol !== 'number') throw new Error('invalid hello');
-        this.helloProtocol = protocol;
-        this.connectedAtMs = Date.now();
-        return;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg === 'connect challenged') {
-          // nonce should now be set via the event handler; retry.
-          await sleep(10);
-          continue;
-        }
-        throw err;
-      } finally {
-        if (this.connectReqId === reqId) this.connectReqId = null;
-      }
+    try {
+      const hello = await this.sendAndWait(frame);
+      const protocol = (hello as any)?.protocol;
+      if (typeof protocol === 'number') this.helloProtocol = protocol;
+      this.connectedAtMs = Date.now();
+    } finally {
+      if (this.connectReqId === reqId) this.connectReqId = null;
     }
   }
 
