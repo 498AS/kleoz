@@ -1,13 +1,20 @@
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { WebSocketServer } from 'ws';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildApp, attachWsHandlers } from './server.js';
 import { verifyToken } from './auth.js';
 
 const { app, hub } = buildApp();
 
 // Serve static files from web dist
-app.use('/*', serveStatic({ root: '../web/dist' }));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const webDist = path.resolve(__dirname, '../../web/dist');
+app.use('/*', async (c, next) => {
+  if (c.req.path.startsWith('/api')) return next();
+  return serveStatic({ root: webDist })(c, next);
+});
 
 const port = Number(process.env.PORT ?? 3000);
 const server = serve({ fetch: app.fetch, port });

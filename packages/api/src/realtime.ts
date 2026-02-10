@@ -1,38 +1,64 @@
 import type { WebSocket } from 'ws';
+import type { PresenceEntry } from './types.js';
 
 interface SocketMeta {
   userId: string;
   username: string;
   agentId: string;
   subscriptions: Set<string>;
-}
-
-interface PresenceEvent {
-  type: 'presence.snapshot' | 'presence.joined' | 'presence.left';
-  users?: string[];
-  username?: string;
+  presenceEnabled: boolean;
+  instanceId: string;
+  connectedAt: number;
+  lastInputAt: number;
 }
 
 export class RealtimeHub {
   private sockets = new Map<WebSocket, SocketMeta>();
 
-  register(ws: WebSocket, meta: Omit<SocketMeta, 'subscriptions'>): void {
-    this.sockets.set(ws, { ...meta, subscriptions: new Set() });
-    this.broadcastPresence({ type: 'presence.joined', username: meta.username });
-    ws.send(JSON.stringify({ type: 'presence.snapshot', users: this.onlineUsers() } satisfies PresenceEvent));
+  register(ws: WebSocket, meta: Pick<SocketMeta, 'userId' | 'username' | 'agentId'>): void {
+    const now = Date.now();
+    this.sockets.set(ws, { ...meta, subscriptions: new Set(), presenceEnabled: false, instanceId: crypto.randomUUID(), connectedAt: now, lastInputAt: now });
   }
 
   unregister(ws: WebSocket): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     this.sockets.delete(ws);
-    this.broadcastPresence({ type: 'presence.left', username: meta.username });
+    this.broadcastPresenceLeft(meta.instanceId);
   }
 
   setSubscriptions(ws: WebSocket, sessionKeys: string[]): void {
     const meta = this.sockets.get(ws);
     if (!meta) return;
     meta.subscriptions = new Set(sessionKeys);
+  }
+
+  removeSubscriptions(ws: WebSocket, sessionKeys: string[]): void {
+    const meta = this.sockets.get(ws);
+    if (!meta) return;
+    for (const k of sessionKeys) meta.subscriptions.delete(k);
+  }
+
+  enablePresence(ws: WebSocket): void {
+    const meta = this.sockets.get(ws);
+    if (!meta) return;
+    meta.presenceEnabled = true;
+    ws.send(JSON.stringify({ type: 'presence.snapshot', entries: this.presenceEntries(), stateVersion: Date.now() }));
+    this.broadcastPresenceJoined(meta);
+  }
+
+  updateClient(ws: WebSocket, client: { instanceId?: string; version?: string; platform?: string; mode?: string }): void {
+    const meta = this.sockets.get(ws);
+    if (!meta) return;
+    if (client.instanceId && typeof client.instanceId === 'string') {
+      meta.instanceId = client.instanceId;
+    }
+  }
+
+  noteInput(ws: WebSocket): void {
+    const meta = this.sockets.get(ws);
+    if (!meta) return;
+    meta.lastInputAt = Date.now();
   }
 
   emitToSession(sessionKey: string, event: object): void {
@@ -43,13 +69,38 @@ export class RealtimeHub {
     }
   }
 
-  private onlineUsers(): string[] {
-    return Array.from(new Set(Array.from(this.sockets.values()).map((s) => s.username)));
+  onlineUserCount(): number {
+    return new Set(Array.from(this.sockets.values()).map((s) => s.userId)).size;
   }
 
-  private broadcastPresence(event: PresenceEvent): void {
-    for (const socket of this.sockets.keys()) {
-      socket.send(JSON.stringify(event));
+  presenceEntries(): PresenceEntry[] {
+    const now = Date.now();
+    return Array.from(this.sockets.values()).map((m) => ({
+      instanceId: m.instanceId,
+      host: 'unknown',
+      ip: 'unknown',
+      version: '0.1.0',
+      platform: 'web',
+      mode: 'webchat',
+      reason: 'connect',
+      lastInputSeconds: Math.floor((now - m.lastInputAt) / 1000),
+      ts: m.lastInputAt,
+    }));
+  }
+
+  private broadcastPresenceJoined(meta: SocketMeta): void {
+    const entry = this.presenceEntries().find((e) => e.instanceId === meta.instanceId);
+    if (!entry) return;
+    for (const [socket, m] of this.sockets.entries()) {
+      if (!m.presenceEnabled) continue;
+      socket.send(JSON.stringify({ type: 'presence.joined', entry }));
+    }
+  }
+
+  private broadcastPresenceLeft(instanceId: string): void {
+    for (const [socket, m] of this.sockets.entries()) {
+      if (!m.presenceEnabled) continue;
+      socket.send(JSON.stringify({ type: 'presence.left', instanceId }));
     }
   }
 }
