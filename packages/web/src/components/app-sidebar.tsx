@@ -25,12 +25,13 @@ import {
   SidebarSeparator,
 } from '@/components/ui/sidebar';
 
-import { MessageSquareText, Monitor, Search, Trash2, Wifi, WifiOff } from 'lucide-react';
+import { MessageSquareText, Monitor, Plus, Search, Trash2, Wifi, WifiOff } from 'lucide-react';
 
 export function AppSidebar(props: {
   user: { id: string; username: string; agentId: string; role: 'admin' | 'user'; createdAt: string };
   sessions: SessionSummary[];
   activeSessionKey: string;
+  onCreateSession: () => void;
   onSelectSession: (k: string) => void;
   onRequestDelete: (k: string) => void;
   wsState: WsClientState;
@@ -80,6 +81,13 @@ export function AppSidebar(props: {
             placeholder="Buscar sesiones..."
             className="pl-9"
           />
+        </div>
+
+        <div className="px-1 group-data-[collapsible=icon]:hidden">
+          <Button variant="outline" size="sm" className="w-full justify-start gap-2" onClick={props.onCreateSession}>
+            <Plus className="h-4 w-4" />
+            Nueva sesion
+          </Button>
         </div>
 
         <SidebarSeparator />

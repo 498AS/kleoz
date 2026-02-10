@@ -674,6 +674,23 @@ export function App() {
         user={user}
         sessions={sessions}
         activeSessionKey={activeSessionKey}
+        onCreateSession={() => {
+          const agentId = me?.agentId || user.agentId || 'main';
+          const peer = `web-${crypto.randomUUID().slice(0, 8)}`;
+          const key = `agent:${agentId}:dm:${peer}`;
+          const now = Date.now();
+          const summary: SessionSummary = {
+            key,
+            sessionId: `local:${crypto.randomUUID()}`,
+            kind: 'dm',
+            channel: 'webchat',
+            displayName: peer,
+            updatedAt: now,
+            status: 'idle',
+          };
+          setSessions((prev) => mergeSession(prev, summary));
+          setActiveSessionKey(key);
+        }}
         onSelectSession={(k) => setActiveSessionKey(k)}
         wsState={wsState}
         presenceList={presenceList}

@@ -10,9 +10,28 @@ import { buildApp } from './server.js';
 import { OpenClawGatewayClient } from './openclaw/gatewayClient.js';
 
 function normalizeChatMessage(raw: any): ChatMessage | null {
-  const id = typeof raw?.id === 'string' && raw.id ? raw.id : crypto.randomUUID();
-  const role = raw?.role === 'assistant' || raw?.role === 'tool' ? raw.role : 'user';
-  const content = typeof raw?.content === 'string' ? raw.content : typeof raw?.body === 'string' ? raw.body : '';
+  function fnv1aHex(s: string): string {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  const roleRaw = typeof raw?.role === 'string' ? raw.role : 'user';
+  const role: ChatMessage['role'] = roleRaw === 'assistant' ? 'assistant' : roleRaw === 'tool' ? 'tool' : 'user';
+
+  let content = '';
+  const rawContent = raw?.content;
+  const parts: any[] = Array.isArray(rawContent) ? rawContent : [];
+  if (typeof rawContent === 'string') content = rawContent;
+  else if (typeof raw?.body === 'string') content = raw.body;
+  else if (parts.length) {
+    const texts: string[] = [];
+    for (const p of parts) if (p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string') texts.push(p.text);
+    content = texts.join('');
+  }
   if (!content) return null;
   const tsRaw = raw?.timestamp ?? raw?.ts ?? raw?.createdAt ?? raw?.created_at;
   const timestamp =
@@ -21,7 +40,15 @@ function normalizeChatMessage(raw: any): ChatMessage | null {
       : typeof tsRaw === 'number'
         ? new Date(tsRaw).toISOString()
         : new Date().toISOString();
-  return { id, role, content, timestamp, model: raw?.model, tokens: raw?.tokens, metadata: raw?.metadata };
+  const tsKey = typeof tsRaw === 'number' ? String(tsRaw) : typeof tsRaw === 'string' ? tsRaw : timestamp;
+  const id =
+    typeof raw?.id === 'string' && raw.id
+      ? raw.id
+      : `oc:${role}:${tsKey}:${fnv1aHex(content)}`;
+  const usage = raw?.usage && typeof raw.usage === 'object' ? raw.usage : undefined;
+  const tokens = usage ? { input: usage.input, output: usage.output } : raw?.tokens;
+  const metadata = raw?.metadata && typeof raw.metadata === 'object' ? raw.metadata : undefined;
+  return { id, role, content, timestamp, model: raw?.model, tokens, metadata };
 }
 
 function wsEventFromGatewayChatPayload(payload: any): WsServerEvent | null {

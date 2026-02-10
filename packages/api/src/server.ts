@@ -83,10 +83,37 @@ function shouldInvokeAgent(sessionKey: string, text: string, claims: JwtClaims):
 }
 
 function normalizeChatMessage(raw: any): ChatMessage | null {
-  const id = typeof raw?.id === 'string' && raw.id ? raw.id : crypto.randomUUID();
-  const role = raw?.role === 'assistant' || raw?.role === 'tool' ? raw.role : 'user';
-  const content = typeof raw?.content === 'string' ? raw.content : typeof raw?.body === 'string' ? raw.body : '';
+  function fnv1aHex(s: string): string {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  const roleRaw = typeof raw?.role === 'string' ? raw.role : 'user';
+  const role: ChatMessage['role'] = roleRaw === 'assistant' ? 'assistant' : roleRaw === 'tool' ? 'tool' : 'user';
+
+  let content = '';
+  const rawContent = raw?.content;
+  const contentParts: any[] = Array.isArray(rawContent) ? rawContent : [];
+  if (typeof rawContent === 'string') {
+    content = rawContent;
+  } else if (typeof raw?.body === 'string') {
+    content = raw.body;
+  } else if (contentParts.length) {
+    // OpenClaw format: content: [{type:'text', text:'...'}, {type:'thinking', thinking:'...'}, ...]
+    const texts: string[] = [];
+    for (const part of contentParts) {
+      if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
+        texts.push(part.text);
+      }
+    }
+    content = texts.join('');
+  }
   if (!content) return null;
+
   const tsRaw = raw?.timestamp ?? raw?.ts ?? raw?.createdAt ?? raw?.created_at;
   const timestamp =
     typeof tsRaw === 'string'
@@ -94,15 +121,41 @@ function normalizeChatMessage(raw: any): ChatMessage | null {
       : typeof tsRaw === 'number'
         ? new Date(tsRaw).toISOString()
         : new Date().toISOString();
-  const model = typeof raw?.model === 'string' ? raw.model : undefined;
+  const tsKey = typeof tsRaw === 'number' ? String(tsRaw) : typeof tsRaw === 'string' ? tsRaw : timestamp;
+  const id =
+    typeof raw?.id === 'string' && raw.id
+      ? raw.id
+      : // OpenClaw messages often don't include an id; derive a stable id so polling/clients can de-dupe.
+        `oc:${role}:${tsKey}:${fnv1aHex(content)}`;
+  const model = typeof raw?.model === 'string' ? raw.model : typeof raw?.modelId === 'string' ? raw.modelId : undefined;
+
+  const usage = raw?.usage && typeof raw.usage === 'object' ? raw.usage : undefined;
   const tokens =
-    raw?.tokens && typeof raw.tokens === 'object'
-      ? {
-          input: typeof raw.tokens.input === 'number' ? raw.tokens.input : undefined,
-          output: typeof raw.tokens.output === 'number' ? raw.tokens.output : undefined,
-        }
-      : undefined;
-  const metadata = raw?.metadata && typeof raw.metadata === 'object' ? (raw.metadata as Record<string, unknown>) : undefined;
+    usage
+      ? { input: typeof usage.input === 'number' ? usage.input : undefined, output: typeof usage.output === 'number' ? usage.output : undefined }
+      : raw?.tokens && typeof raw.tokens === 'object'
+        ? {
+            input: typeof raw.tokens.input === 'number' ? raw.tokens.input : undefined,
+            output: typeof raw.tokens.output === 'number' ? raw.tokens.output : undefined,
+          }
+        : undefined;
+
+  const metadataBase = raw?.metadata && typeof raw.metadata === 'object' ? (raw.metadata as Record<string, unknown>) : {};
+  const metadata: Record<string, unknown> = {
+    ...metadataBase,
+    ...(typeof raw?.provider === 'string' ? { provider: raw.provider } : {}),
+    ...(typeof raw?.api === 'string' ? { api: raw.api } : {}),
+    ...(typeof raw?.stopReason === 'string' ? { stopReason: raw.stopReason } : {}),
+  };
+
+  // Preserve non-text parts (thinking, etc.) in metadata for debugging/UI.
+  if (contentParts.length) {
+    const thinking = contentParts.find((p) => p && typeof p === 'object' && p.type === 'thinking');
+    if (thinking && typeof thinking.thinking === 'string') metadata.thinking = thinking.thinking;
+    if (thinking && typeof thinking.thinkingSignature === 'string') metadata.thinkingSignature = thinking.thinkingSignature;
+    metadata.contentParts = contentParts.map((p) => (p && typeof p === 'object' ? { type: p.type } : { type: typeof p }));
+  }
+
   return { id, role, content, timestamp, model, tokens, metadata };
 }
 
@@ -130,6 +183,107 @@ export function buildApp(args: {
 }) {
   const { cfg, store, hub, gateway } = args;
   const app = new Hono<{ Variables: Variables }>();
+
+  // Since OpenClaw may not stream deltas via gateway events (or we may not have subscriptions),
+  // we provide a polling-based streamer that emits message.delta/complete to all subscribed clients.
+  const activeAssistantPolls = new Map<string, { cancelled: boolean }>();
+
+  function startAssistantPolling(args: { sessionKey: string; runId: string; afterTsMs: number }): void {
+    const pollKey = `${args.sessionKey}:${args.runId}`;
+    if (activeAssistantPolls.has(pollKey)) return;
+
+    const state = { cancelled: false };
+    activeAssistantPolls.set(pollKey, state);
+
+    void (async () => {
+      let lastMsgId = '';
+      let lastContent = '';
+      let lastSeenAt = 0;
+      let stableCount = 0;
+
+      const startedAt = Date.now();
+      const deadline = startedAt + 180_000; // 3 minutes max per run
+      let delayMs = 700;
+
+      while (!state.cancelled && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        delayMs = Math.min(2500, Math.floor(delayMs * 1.25));
+
+        const hist = await gateway
+          .rpc<{ messages?: any[] }>('chat.history', { sessionKey: args.sessionKey, limit: 30 })
+          .catch(() => ({ messages: [] }));
+        const msgs = Array.isArray((hist as any).messages) ? ((hist as any).messages as any[]) : [];
+        const normalized = msgs
+          .map(normalizeChatMessage)
+          .filter((m): m is ChatMessage => Boolean(m))
+          .filter((m) => {
+            const ts = Date.parse(m.timestamp);
+            return Number.isFinite(ts) ? ts >= args.afterTsMs - 2000 : true;
+          });
+
+        // Pick last assistant message in the window.
+        const assistant = normalized
+          .slice()
+          .reverse()
+          .find((m) => m.role === 'assistant' && typeof m.content === 'string' && m.content.length > 0);
+
+        if (!assistant) continue;
+
+        // If gateway rotates message IDs, reset our delta state.
+        if (assistant.id !== lastMsgId) {
+          lastMsgId = assistant.id;
+          lastContent = '';
+          stableCount = 0;
+        }
+
+        const next = assistant.content;
+        if (next.startsWith(lastContent)) {
+          const delta = next.slice(lastContent.length);
+          if (delta) {
+            hub.emitToSession(args.sessionKey, { type: 'message.delta', sessionKey: args.sessionKey, runId: args.runId, delta: { content: delta } });
+            hub.broadcast({ type: 'session.status', sessionKey: args.sessionKey, status: 'typing' });
+            stableCount = 0;
+          } else {
+            stableCount += 1;
+          }
+          lastContent = next;
+        } else {
+          // Non-prefix change (rare): treat as a reset.
+          lastContent = next;
+          stableCount = 0;
+        }
+
+        lastSeenAt = Date.now();
+
+        // If content hasn't changed for ~2 polls after we've seen any content, consider it complete.
+        if (lastContent && stableCount >= 2) {
+          hub.emitToSession(args.sessionKey, { type: 'message.complete', sessionKey: args.sessionKey, runId: args.runId, message: assistant });
+          hub.broadcast({ type: 'session.status', sessionKey: args.sessionKey, status: 'idle' });
+          activeAssistantPolls.delete(pollKey);
+          return;
+        }
+      }
+
+      // Timeout: if we saw something, emit it as complete, otherwise raise an error.
+      if (lastContent && lastMsgId) {
+        hub.emitToSession(args.sessionKey, {
+          type: 'message.complete',
+          sessionKey: args.sessionKey,
+          runId: args.runId,
+          message: { id: lastMsgId, role: 'assistant', content: lastContent, timestamp: new Date(lastSeenAt || Date.now()).toISOString() },
+        });
+      } else {
+        hub.emitToSession(args.sessionKey, {
+          type: 'error',
+          sessionKey: args.sessionKey,
+          runId: args.runId,
+          error: { code: 'AGENT_TIMEOUT', message: 'El agente no respondio a tiempo.' },
+        });
+      }
+      hub.broadcast({ type: 'session.status', sessionKey: args.sessionKey, status: 'idle' });
+      activeAssistantPolls.delete(pollKey);
+    })();
+  }
 
   const loginSchema = z.object({ username: z.string().min(1), password: z.string().min(1) } satisfies Record<keyof AuthLoginRequest, any>);
   const sendSchema = z.object({
@@ -292,13 +446,11 @@ export function buildApp(args: {
   app.get('/api/sessions', auth, async (c) => {
     const claims = c.get('user') as JwtClaims;
     const limit = Number(c.req.query('limit') ?? '50') || 50;
-    const activeMinutes = c.req.query('activeMinutes');
     const kind = c.req.query('kind');
 
     const payload = await gateway
       .rpc<{ sessions?: any[] }>('sessions.list', {
         limit,
-        activeMinutes: activeMinutes ? Number(activeMinutes) : undefined,
         includeLastMessage: true,
         includeDerivedTitles: true,
       })
@@ -348,14 +500,11 @@ export function buildApp(args: {
 
     const limit = Number(c.req.query('limit') ?? '100') || 100;
     const includeTools = c.req.query('includeTools') === 'true';
-    const before = c.req.query('before');
 
     const payload = await gateway
       .rpc<{ messages?: any[]; nextCursor?: string; hasMore?: boolean }>('chat.history', {
         sessionKey,
         limit,
-        includeTools,
-        before,
       })
       .catch(() => ({ messages: [], hasMore: false }));
 
@@ -422,6 +571,7 @@ export function buildApp(args: {
 
     const userMsgId = crypto.randomUUID();
     const now = Date.now();
+    const invoke = shouldInvokeAgent(body.sessionKey, body.message, claims);
     const userMessage: ChatMessage = {
       id: userMsgId,
       role: 'user',
@@ -430,17 +580,19 @@ export function buildApp(args: {
       metadata: { from: claims.username, userId: claims.sub, source: 'kleoz' },
     };
 
-    // Persist locally (so it doesn't vanish from history when we don't invoke the agent).
-    store.putLocalMessage({
-      id: userMsgId,
-      session_key: body.sessionKey,
-      role: 'user',
-      content: body.message,
-      timestamp: now,
-      metadata_json: JSON.stringify(userMessage.metadata ?? {}),
-      model: null,
-      tokens_json: null,
-    });
+    // Persist locally only when we do NOT invoke the agent (otherwise the gateway will persist it and we'd duplicate).
+    if (!invoke) {
+      store.putLocalMessage({
+        id: userMsgId,
+        session_key: body.sessionKey,
+        role: 'user',
+        content: body.message,
+        timestamp: now,
+        metadata_json: JSON.stringify(userMessage.metadata ?? {}),
+        model: null,
+        tokens_json: null,
+      });
+    }
 
     // Broadcast immediately for multiplayer realtime.
     hub.emitToSession(body.sessionKey, {
@@ -451,7 +603,6 @@ export function buildApp(args: {
     });
     hub.broadcast({ type: 'session.updated', sessionKey: body.sessionKey, changes: { updatedAt: now } });
 
-    const invoke = shouldInvokeAgent(body.sessionKey, body.message, claims);
     if (!invoke) {
       const out: MessagesSendResponse = { ok: true, runId: `local:${userMsgId}`, status: 'accepted' };
       return c.json(out);
@@ -469,24 +620,8 @@ export function buildApp(args: {
         idempotencyKey: crypto.randomUUID(),
       });
 
-      // Fallback: if the gateway doesn't stream events, poll a bit and emit the last assistant message.
-      void (async () => {
-        for (let i = 0; i < 6; i++) {
-          await new Promise((r) => setTimeout(r, 400 * (i + 1)));
-          const hist = await gateway
-            .rpc<{ messages?: any[] }>('chat.history', { sessionKey: body.sessionKey, limit: 10 })
-            .catch(() => ({ messages: [] }));
-          const msgs = Array.isArray((hist as any).messages) ? ((hist as any).messages as any[]) : [];
-          const last = msgs
-            .map(normalizeChatMessage)
-            .filter((m): m is ChatMessage => Boolean(m))
-            .reverse()
-            .find((m) => m.role === 'assistant');
-          if (!last) continue;
-          hub.emitToSession(body.sessionKey, { type: 'message.complete', sessionKey: body.sessionKey, runId: res.runId, message: last });
-          break;
-        }
-      })();
+      // Streaming via polling.
+      startAssistantPolling({ sessionKey: body.sessionKey, runId: res.runId, afterTsMs: now });
 
       const out: MessagesSendResponse = { ok: true, runId: res.runId, status: 'accepted' };
       return c.json(out);
