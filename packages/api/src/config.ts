@@ -30,6 +30,16 @@ function parseDurationSeconds(value: string | undefined, fallbackSeconds: number
   }
 }
 
+function normalizeGatewayUrl(raw: string | undefined, fallback: string): string {
+  const v = (raw ?? '').trim();
+  if (!v) return fallback;
+  if (v.startsWith('wss://') || v.startsWith('ws://')) return v;
+  if (v.startsWith('https://')) return `wss://${v.slice('https://'.length)}`;
+  if (v.startsWith('http://')) return `ws://${v.slice('http://'.length)}`;
+  // Accept host:port or similar.
+  return `ws://${v}`;
+}
+
 const repoRoot = process.cwd();
 const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.resolve(repoRoot, 'data');
 
@@ -40,7 +50,7 @@ export const config = {
   },
   dataDir,
   gateway: {
-    url: process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789',
+    url: normalizeGatewayUrl(process.env.OPENCLAW_GATEWAY_URL, 'ws://127.0.0.1:18789'),
     token: process.env.OPENCLAW_GATEWAY_TOKEN ?? '',
     password: process.env.OPENCLAW_GATEWAY_PASSWORD ?? '',
   },
