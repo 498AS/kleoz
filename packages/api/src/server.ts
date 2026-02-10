@@ -9,6 +9,8 @@ import type { ChatMessage, JwtClaims, Variables } from './types.js';
 import { RealtimeHub } from './realtime.js';
 import { config } from './config.js';
 import { createRateLimiter } from './rateLimit.js';
+import { OpenClawGatewayClient } from './openclaw/gatewayClient.js';
+import type { OpenClawChatEvent } from './openclaw/gatewayClient.js';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -26,8 +28,77 @@ function permissionsFor(role: JwtClaims['role']) {
   };
 }
 
-export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
+function extractOpenClawText(message: unknown): string {
+  if (typeof message === 'string') return message;
+  if (!message || typeof message !== 'object') return '';
+  const m = message as any;
+  const content = Array.isArray(m.content) ? m.content : [];
+  for (const part of content) {
+    if (part && typeof part === 'object' && typeof (part as any).text === 'string') {
+      return String((part as any).text);
+    }
+  }
+  return '';
+}
+
+export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub(), gateway?: OpenClawGatewayClient) {
   const app = new Hono<{ Variables: Variables }>();
+  const openclaw = gateway ?? new OpenClawGatewayClient();
+
+  // Track active agent runs to compute deltas and finalize messages.
+  const runState = new Map<string, { sessionKey: string; lastText: string }>();
+
+  openclaw.onChatEvent = (evt: OpenClawChatEvent) => {
+    const state = runState.get(evt.runId);
+    if (!state) return;
+    if (evt.sessionKey !== state.sessionKey) return;
+
+    if (evt.state === 'delta') {
+      const nextText = extractOpenClawText(evt.message);
+      if (!nextText) return;
+      const last = state.lastText;
+      const delta = nextText.startsWith(last) ? nextText.slice(last.length) : nextText;
+      state.lastText = nextText;
+      if (delta) {
+        hub.emitToSession(state.sessionKey, { type: 'message.delta', sessionKey: state.sessionKey, runId: evt.runId, delta: { content: delta } });
+      }
+      hub.emitToSession(state.sessionKey, { type: 'session.status', sessionKey: state.sessionKey, status: 'thinking' });
+      return;
+    }
+
+    if (evt.state === 'final') {
+      const text = (extractOpenClawText(evt.message) || state.lastText).trim();
+      runState.delete(evt.runId);
+      hub.emitToSession(state.sessionKey, { type: 'session.status', sessionKey: state.sessionKey, status: 'idle' });
+      if (!text) return;
+      const agentId = /^agent:([^:]+):/.exec(state.sessionKey)?.[1];
+      const msg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: text,
+        timestamp: nowIso(),
+        model: 'openclaw',
+        tokens: undefined,
+        metadata: { agentId: agentId ?? 'main', stopReason: evt.stopReason, usage: evt.usage },
+      };
+      store.appendRoomMessage(state.sessionKey, msg, { runId: evt.runId });
+      hub.emitToSession(state.sessionKey, { type: 'message.complete', sessionKey: state.sessionKey, runId: evt.runId, message: msg });
+      hub.emitToSession(state.sessionKey, { type: 'session.updated', sessionKey: state.sessionKey, changes: { updatedAt: Date.now() } });
+      if (agentId) hub.emitToAgent(agentId, { type: 'session.updated', sessionKey: state.sessionKey, changes: { updatedAt: Date.now() } });
+      return;
+    }
+
+    if (evt.state === 'error' || evt.state === 'aborted') {
+      runState.delete(evt.runId);
+      hub.emitToSession(state.sessionKey, { type: 'session.status', sessionKey: state.sessionKey, status: 'idle' });
+      hub.emitToSession(state.sessionKey, {
+        type: 'error',
+        sessionKey: state.sessionKey,
+        runId: evt.runId,
+        error: { code: evt.state === 'aborted' ? 'INVALID_REQUEST' : 'AGENT_TIMEOUT', message: evt.errorMessage ?? 'Agent error' },
+      });
+    }
+  };
 
   app.onError((err, c) => {
     if (err instanceof z.ZodError) {
@@ -95,7 +166,7 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
     return c.json({
       status: 'ok',
       timestamp: nowIso(),
-      gateway: { connected: false, latency: undefined },
+      gateway: { connected: openclaw.connected(), latency: openclaw.latencyMs() },
       database: { connected: true },
     });
   });
@@ -305,22 +376,59 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
       (agentId ? new RegExp(`@${agentId}\\b`, 'i').test(parsed.message) : false);
 
     if (mentionsAgent) {
-      const content = `Respuesta automática para: ${parsed.message.replace(/@agent/gi, '').trim()}`;
-      // Simulated streaming: 2 deltas + complete.
-      const mid = Math.max(1, Math.floor(content.length / 2));
-      hub.emitToSession(sessionKey, { type: 'message.delta', sessionKey, runId, delta: { content: content.slice(0, mid) } });
-      hub.emitToSession(sessionKey, { type: 'message.delta', sessionKey, runId, delta: { content: content.slice(mid) } });
-      const msg: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content,
-        timestamp: nowIso(),
-        model: 'mock',
-        tokens: { input: undefined, output: undefined },
-        metadata: { agentId: agentId ?? user.agentId },
-      };
-      store.appendRoomMessage(sessionKey, msg, { runId });
-      hub.emitToSession(sessionKey, { type: 'message.complete', sessionKey, runId, message: msg });
+      if (openclaw.enabled()) {
+        openclaw.start();
+        runState.set(runId, { sessionKey, lastText: '' });
+        hub.emitToSession(sessionKey, { type: 'session.status', sessionKey, status: 'thinking' });
+
+        const cleaned = parsed.message
+          .replace(/@agent\b/gi, '')
+          .replace(agentId ? new RegExp(`@${agentId}\\b`, 'gi') : /^$/, '')
+          .trim();
+        const attachments = (parsed.attachments ?? []).map((a) => ({
+          type: a.type,
+          mimeType: a.mimeType,
+          fileName: a.filename,
+          content: a.data,
+        }));
+
+        openclaw
+          .request('chat.send', {
+            sessionKey,
+            message: cleaned || parsed.message,
+            deliver: false,
+            timeoutMs: 120_000,
+            idempotencyKey: runId,
+            attachments: attachments.length ? attachments : undefined,
+          })
+          .catch((err) => {
+            runState.delete(runId);
+            hub.emitToSession(sessionKey, { type: 'session.status', sessionKey, status: 'idle' });
+            hub.emitToSession(sessionKey, {
+              type: 'error',
+              sessionKey,
+              runId,
+              error: { code: 'GATEWAY_UNAVAILABLE', message: err instanceof Error ? err.message : String(err) },
+            });
+          });
+      } else {
+        const content = `Respuesta automática para: ${parsed.message.replace(/@agent/gi, '').trim()}`;
+        // Simulated streaming: 2 deltas + complete.
+        const mid = Math.max(1, Math.floor(content.length / 2));
+        hub.emitToSession(sessionKey, { type: 'message.delta', sessionKey, runId, delta: { content: content.slice(0, mid) } });
+        hub.emitToSession(sessionKey, { type: 'message.delta', sessionKey, runId, delta: { content: content.slice(mid) } });
+        const msg: ChatMessage = {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content,
+          timestamp: nowIso(),
+          model: 'mock',
+          tokens: { input: undefined, output: undefined },
+          metadata: { agentId: agentId ?? user.agentId },
+        };
+        store.appendRoomMessage(sessionKey, msg, { runId });
+        hub.emitToSession(sessionKey, { type: 'message.complete', sessionKey, runId, message: msg });
+      }
     }
 
     return c.json({ ok: true, runId, status: 'accepted' });
@@ -349,7 +457,7 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
   });
 
   app.get('/api/presence', auth, (c) => {
-    return c.json({ entries: hub.presenceEntries(), gatewayUptime: 0, timestamp: Date.now() });
+    return c.json({ entries: hub.presenceEntries(), gatewayUptime: openclaw.uptimeSeconds(), timestamp: Date.now() });
   });
 
   const startedAt = Date.now();
@@ -360,7 +468,7 @@ export function buildApp(store = new SQLiteStore(), hub = new RealtimeHub()) {
     return c.json({
       version: config.version,
       uptime,
-      gateway: { url: config.gateway.url, connected: false, protocol: undefined },
+      gateway: { url: config.gateway.url, connected: openclaw.connected(), protocol: openclaw.protocol() },
       sessions: { active: sessions.active, total: sessions.total },
       users: { online: hub.onlineUserCount(), total: users },
       startedAt,

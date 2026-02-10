@@ -5,8 +5,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildApp, attachWsHandlers } from './server.js';
 import { verifyToken } from './auth.js';
+import { OpenClawGatewayClient } from './openclaw/gatewayClient.js';
 
-const { app, hub } = buildApp();
+const gateway = new OpenClawGatewayClient();
+gateway.start();
+const { app, hub } = buildApp(undefined, undefined, gateway);
 
 // Serve static files from web dist
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

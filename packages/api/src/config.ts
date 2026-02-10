@@ -42,6 +42,7 @@ export const config = {
   gateway: {
     url: process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789',
     token: process.env.OPENCLAW_GATEWAY_TOKEN ?? '',
+    password: process.env.OPENCLAW_GATEWAY_PASSWORD ?? '',
   },
   auth: {
     jwtSecret: process.env.JWT_SECRET ?? 'kleoz-dev-secret',
@@ -64,4 +65,3 @@ export const config = {
     wsMessage: { points: 60, windowSeconds: 60 },
   },
 } as const;
-
