@@ -1,0 +1,14 @@
+{
+  "name": "kleoz",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w @kleoz/api\" \"npm run dev -w @kleoz/web\"",
+    "build": "npm run build -w @kleoz/api && npm run build -w @kleoz/web",
+    "test": "npm run test -w @kleoz/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
