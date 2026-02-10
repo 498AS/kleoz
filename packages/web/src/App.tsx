@@ -109,6 +109,10 @@ export function App() {
   const activeState = useMemo(() => sessionsState[activeSessionKey], [sessionsState, activeSessionKey]);
   const activeMessages = activeState?.messages ?? [];
   const activeStreaming = activeState?.streamingByRunId ?? {};
+  const attachmentsPending = useMemo(
+    () => composerAttachments.some((a) => !a.dataBase64 && !a.error),
+    [composerAttachments],
+  );
 
   // Boot from localStorage.
   useEffect(() => {
@@ -490,6 +494,10 @@ export function App() {
     }
     const text = composerText.trim();
     if (!text && composerAttachments.length === 0) return;
+    if (attachmentsPending) {
+      setGlobalNotice('Esperando a procesar attachments (base64).');
+      return;
+    }
 
     const attachments: MessageAttachment[] = [];
     for (const a of composerAttachments) {
@@ -679,7 +687,11 @@ export function App() {
               disabled={sending || !activeSessionKey}
               onChange={(e) => void handlePickFiles(e.target.files)}
             />
-            <button className="btn primary" disabled={sending || (!composerText.trim() && composerAttachments.length === 0) || !activeSessionKey} onClick={() => void handleSend()}>
+            <button
+              className="btn primary"
+              disabled={sending || attachmentsPending || (!composerText.trim() && composerAttachments.length === 0) || !activeSessionKey}
+              onClick={() => void handleSend()}
+            >
               {sending ? 'Enviando...' : 'Enviar'}
             </button>
           </div>
@@ -692,6 +704,7 @@ export function App() {
                     <div className="attachment-name">{a.filename}</div>
                     <div className="muted small">
                       {a.mimeType}
+                      {!a.dataBase64 && !a.error ? ' · procesando...' : ''}
                       {a.upload?.url ? (
                         <>
                           {' '}
@@ -754,4 +767,3 @@ function MessageBubble(props: { msg: ChatMessage }) {
     </div>
   );
 }
-
