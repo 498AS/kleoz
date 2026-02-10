@@ -6,7 +6,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:3000'
+      // Dev-only proxy. Runtime code uses relative "/api" and same-origin WS derived from window.location.
+      '/api': process.env.KLEOZ_API_PROXY_TARGET ?? 'http://localhost:3000'
     }
   }
 });

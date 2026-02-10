@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build"
   },
   "dependencies": {
+    "@kleoz/contracts": "0.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

@@ -9,6 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@kleoz/contracts": "0.1.0",
     "bcryptjs": "^2.4.3",
     "hono": "^4.7.2",
     "jose": "^5.9.6",
